@@ -1,3 +1,14 @@
+/* Self-hosted fonts, served from our own origin.
+   Imported BEFORE the Tailwind layers so the @font-face rules are registered
+   first. See index.html for why these are not loaded from Google's CDN. */
+@import '@fontsource/roboto/400.css';
+@import '@fontsource/roboto/500.css';
+@import '@fontsource/roboto/700.css';
+/* outlined.css, not index.css: index pulls in the rounded and sharp variants
+   too, which is 11 MB of fonts for three sets we never use. The outlined
+   variable font alone is what the design system specifies. */
+@import 'material-symbols/outlined.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

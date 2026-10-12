@@ -11,27 +11,15 @@
     <meta name="theme-color" content="#202124" />
     <title>BridgeTalk</title>
 
-    <!-- Roboto and Material Symbols, per the interface specification.
-         preconnect first: it opens the TLS connection while the HTML is still
-         parsing, which removes about 100 ms from first paint.
+    <!-- Fonts are SELF-HOSTED, loaded by src/index.css from npm packages.
+         They used to come from Google's CDN, and that was Bug 5: on a cold
+         cache the icon font took over two seconds to arrive — measured — and
+         on a restricted or offline network it never arrived at all. Icon
+         glyphs were then absent and body text fell back to the system sans,
+         whose metrics differ, so text and icons read as misaligned.
 
-         `display=block` on the icon font is deliberate. The icons are
-         ligatures, so with `swap` the browser paints the literal ligature
-         names ("mic", "videocam") in a fallback font for a moment, and the
-         control bar visibly reads as words before turning into icons.
-         `block` shows nothing until the font arrives, which is the lesser
-         evil. Every icon is aria-hidden with its label on the button, so a
-         screen reader is unaffected either way. -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap"
-      rel="stylesheet"
-    />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=block"
-      rel="stylesheet"
-    />
+         Self-hosting also removes the last runtime dependency on a third
+         party, so the application now runs entirely offline after setup. -->
   </head>
   <body>
     <!-- React mounts here. The noscript message matters: this is an

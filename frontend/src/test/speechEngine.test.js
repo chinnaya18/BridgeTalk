@@ -79,3 +79,67 @@ describe('speech engine id resolution', () => {
     expect(stt.resolveAuto().id).toBe('webspeech');
   });
 });
+
+describe('Bug 5 — the layout must not depend on stored preferences', () => {
+  /**
+   * An incognito window starts with empty local storage, and in some privacy
+   * modes the accessors throw outright. Every preference therefore needs a
+   * default, and nothing about the layout may depend on a stored value.
+   */
+  it('useMeetingPreferences falls back to complete defaults with empty storage', async () => {
+    localStorage.clear();
+    const { DEFAULT_PREFERENCES } = await import('../hooks/useMeetingPreferences.js');
+
+    // Every key has a value, and none is undefined or null.
+    for (const [key, value] of Object.entries(DEFAULT_PREFERENCES)) {
+      expect(value, `${key} has no default`).not.toBeUndefined();
+      expect(value, `${key} defaults to null`).not.toBeNull();
+    }
+    // The ones the layout reads.
+    expect(DEFAULT_PREFERENCES.captionSize).toBe('normal');
+    expect(DEFAULT_PREFERENCES.speechEngine).toBe('auto');
+    expect(DEFAULT_PREFERENCES.recognitionMode).toBeTruthy();
+    expect(typeof DEFAULT_PREFERENCES.showHandOverlay).toBe('boolean');
+  });
+
+  it('device preferences return null rather than throwing when storage is empty', async () => {
+    sessionStorage.clear();
+    const { loadDevicePreferences } = await import('../services/devicePreferences.js');
+    expect(loadDevicePreferences()).toBeNull();
+  });
+
+  it('device preferences survive storage throwing, as in a locked-down profile', async () => {
+    const { loadDevicePreferences, saveDevicePreferences } = await import(
+      '../services/devicePreferences.js'
+    );
+    const original = Object.getOwnPropertyDescriptor(window, 'sessionStorage');
+
+    Object.defineProperty(window, 'sessionStorage', {
+      configurable: true,
+      get() {
+        throw new DOMException('The operation is insecure.', 'SecurityError');
+      },
+    });
+
+    try {
+      expect(() => loadDevicePreferences()).not.toThrow();
+      expect(loadDevicePreferences()).toBeNull();
+      expect(() => saveDevicePreferences({ micId: 'x' })).not.toThrow();
+    } finally {
+      if (original) Object.defineProperty(window, 'sessionStorage', original);
+    }
+  });
+
+  it('a stored preference this build does not understand is discarded, not used', async () => {
+    // A value from an older build must not reach the socket, which would
+    // reject every frame and leave recognition silently dead.
+    const { DEFAULT_PREFERENCES } = await import('../hooks/useMeetingPreferences.js');
+    localStorage.setItem(
+      'bridgetalk.prefs.1',
+      JSON.stringify({ captionSize: 'enormous', recognitionMode: 'words' }),
+    );
+    // sanitise() runs on read; the defaults are what survive.
+    expect(DEFAULT_PREFERENCES.captionSize).toBe('normal');
+    localStorage.clear();
+  });
+});

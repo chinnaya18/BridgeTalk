@@ -219,3 +219,6 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Bug 5 screenshot comparison output (regenerated on demand)
+frontend/screenshots*/

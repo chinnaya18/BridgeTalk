@@ -702,3 +702,159 @@ that rejoining wrote a new row. Rewritten as
 | Build | succeeded | **succeeded** |
 
 ---
+
+## Fix 6 — Bug 5: the layout broke in an incognito window
+
+### Reproduced with automated screenshots
+
+`frontend/scripts/compare-profiles.mjs` *(new)* drives Chromium through
+Playwright and captures every page twice:
+
+- **warm** — one context visits the page twice, so the second visit has the
+  fonts and assets cached, like a profile that has used the app before;
+- **cold** — a brand-new context per page, with empty cache and empty storage,
+  which is the state an incognito window starts in.
+
+Run with `npm run compare:profiles`, or `npm run compare:profiles:offline` to
+block Google's font CDN.
+
+**Two instruments, because the first one alone was useless.** The initial
+version compared PNG *encoded bytes* and reported "100.00% different" for two
+screenshots that were nearly identical — PNG is compressed, so any size change
+reads as total difference. It now reports:
+
+1. a real **pixel** difference, via `pixelmatch` and `pngjs`;
+2. a **layout fingerprint** read from the DOM — bounding boxes of the top bar,
+   the heading, the first button and every icon, plus whether each webfont has
+   loaded, plus whether the document overflows its viewport.
+
+The fingerprint is the better instrument, and it is what the gate uses. "Text
+and icons are misaligned" is a *layout* statement, and the fingerprint says
+precisely which element moved and by how much — a pixel diff on a page with a
+live camera feed is meaningless, because the frame changes between shots.
+
+### What the measurement actually showed
+
+**Waiting for `document.fonts.ready` hid the bug.** With that wait in place,
+warm and cold were byte-identical on all 15 page/width combinations — because
+the wait is for exactly the thing that causes the problem.
+
+So the CDN was blocked, which is what a restricted or flaky network does.
+Probing the real font state then gave the diagnosis:
+
+| | Icon font after 2.5 s | Requests to Google |
+|---|---|---|
+| **Before, CDN reachable** | `Material Symbols Outlined: loading` — **still not loaded** | 4 |
+| **Before, CDN blocked** | never loads | 2 aborted |
+
+So on a cold cache the icon font took **over two seconds** to arrive even on a
+good connection, and on a restricted network never arrived.
+
+### Root cause
+
+Of the four candidates the brief listed:
+
+| Candidate | Finding |
+|---|---|
+| **Fonts loaded from Google's CDN** | **Yes — this is the cause.** Measured above |
+| Icons without a fixed-size box | **Already handled.** `components/ui/Icon.jsx` sets explicit `width`, `height` and `fontSize` inline, so a late font cannot resize the box. Measured: the icon box was 20×20 in every condition. This is *why* the layout did not collapse outright — the glyphs were simply absent |
+| Missing saved preferences | **No.** `useMeetingPreferences` has a complete `DEFAULT_PREFERENCES` plus a `sanitise()` that discards unknown values, and `devicePreferences` returns `null` safely. Now covered by tests |
+| Browser zoom | **No.** Measured at 80%, 100% and 125%: no horizontal overflow on any page |
+
+With the icon boxes already fixed, the visible symptom was **absent icon glyphs**
+(`font-display: block` renders nothing until the font loads) together with
+**body text falling back to the system sans**, whose metrics differ from
+Roboto's — so text wrapped differently and read as misaligned against icons that
+were holding their space but showing nothing.
+
+### Fix — self-host both fonts
+
+| Change | Detail |
+|---|---|
+`@fontsource/roboto@5.1.0` | Roboto 400/500/700, from npm |
+`material-symbols@0.27.0` | The outlined variable font, from npm |
+`src/index.css` | `@import`s those faces before the Tailwind layers |
+`index.html` | **Both `<link>` tags to Google's CDN removed**, along with the two `preconnect`s |
+
+`material-symbols/outlined.css` is imported, **not** `index.css` — the index
+pulls in the rounded and sharp variants too, which is **11 MB** of fonts for
+three sets the design system never uses. Outlined alone is 3.4 MB, served from
+our own origin and cached after first load.
+
+**This also removes the last runtime dependency on a third party**, so the
+application now runs entirely offline after setup. That closes issue **K-14**
+from the documentation's known-issues list.
+
+### Verified after the fix
+
+The decisive test: with the fonts self-hosted, **blocking Google's CDN must
+change nothing**.
+
+| | Requests to Google | Icon font |
+|---|---|---|
+| **After, CDN reachable** | **0** | `loaded` |
+| **After, CDN blocked** | **0** | `loaded` |
+
+Identical. And the full comparison, **run with the CDN blocked**:
+
+```
+  page          width   pixels differ   layout same   icon font (cold)   overflow
+  home          1024        0.00%       yes           loaded             no
+  home          1280        0.00%       yes           loaded             no
+  home          1920        0.00%       yes           loaded             no
+  history       1024/1280/1920  0.00%   yes           loaded             no
+  lobby         1024/1280/1920  0.00%   yes           loaded             no
+  meeting       1024/1280/1920  0.00%   yes           loaded             no
+  transcript    1024/1280/1920  0.00%   yes           loaded             no
+
+  worst pixel difference : 0.00%
+  layouts that differ    : 0 of 15
+  icon font not loaded   : 0 of 15 (cold profile)
+  horizontal overflow    : 0 of 15
+```
+
+All five pages — Home, Lobby, Meeting (with captions showing), History,
+Transcript — at **1024, 1280 and 1920 px**, plus a zoom sweep at **80%, 100%
+and 125%** with no overflow reported at any of them.
+
+### Tests
+
+`frontend/src/test/speechEngine.test.js` — **4 added**:
+
+1. `DEFAULT_PREFERENCES` has a non-null value for every key
+2. `loadDevicePreferences()` returns `null` with empty storage rather than throwing
+3. it survives `sessionStorage` **throwing**, as in a locked-down profile
+4. a stored preference this build does not understand is discarded, not used
+
+### Two-device development setup
+
+Interview mode and speech recognition cannot be tested honestly with two windows
+on one laptop: clicking the other window is a genuine focus change, so every
+interaction records a violation, and both windows share one microphone.
+
+`npm run dev:lan` sets `BRIDGETALK_LAN=1`, which turns on three things in
+`vite.config.js`:
+
+| | Why |
+|---|---|
+| `host: true` | Another device on the Wi-Fi can reach it |
+| **HTTPS** via `@vitejs/plugin-basic-ssl@2.1.0` | `getUserMedia` requires a secure context and only `localhost` is exempt; over plain `http://192.168.x.x` the camera prompt never appears |
+| A **proxy** for `/api`, `/ws` and `/health` | One address, one certificate. Without it the browser must also accept a second self-signed certificate for the backend, which it will not do silently for a WebSocket — the socket fails with no usable error. `ws: true` is what performs the upgrade |
+
+`.env.example` documents adding the LAN origin to `CORS_ORIGINS`, and the README
+has the full steps under **"Testing with two devices"**.
+
+**The production configuration is untouched.** `vite build` is unaffected, and
+`npm run dev` still serves plain HTTP on localhost only — verified by loading
+the config both ways.
+
+### Suites after this fix
+
+| Suite | Baseline | Now |
+|---|---|---|
+| Backend | 258 passed, 2 skipped | **276 passed, 2 skipped** |
+| Lint | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend tests | 13 passed | **71 passed** |
+| Build | succeeded | **succeeded** |
+
+---

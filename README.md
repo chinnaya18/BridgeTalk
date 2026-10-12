@@ -959,24 +959,69 @@ tabs would be the same user.
 Log in as `deaf.demo@example.com` in one and `hearing.demo@example.com` in the
 other, create a meeting in the first, join by code in the second.
 
-### Two laptops on one network
+### Testing with two devices
 
-Start the backend as usual (it already binds `0.0.0.0`), then serve the frontend
-with `--host`:
+**Two windows on one laptop is not enough for everything.** Interview mode and
+speech recognition both need two real devices:
+
+- **Interview mode** detects the window losing focus. Clicking the *other*
+  window on the same laptop is a genuine focus change, so every interaction
+  records a violation and the blocking overlay fights you.
+- **Speech recognition** runs on the microphone. Two windows share one
+  microphone, so both recognisers hear the same voice and caption it twice.
+
+`npm run dev:lan` exists for this. It turns on three things at once:
+
+| | Why |
+|---|---|
+| `host: true` | Listen on every interface, so another device on the Wi-Fi can reach it |
+| **HTTPS**, via `@vitejs/plugin-basic-ssl` | Not optional. `getUserMedia` requires a *secure context*, and only `localhost` is exempt — over plain `http://192.168.x.x` the camera prompt never appears at all |
+| A **proxy** for `/api`, `/ws` and `/health` | So the second device needs **one** address and trusts **one** certificate. Without it the browser must also accept a second self-signed certificate for the backend, which it will not do silently for a WebSocket — the socket just fails with no usable error |
+
+**Steps:**
 
 ```bash
-cd frontend && npm run dev -- --host
+# 1. Backend as usual. It already binds 0.0.0.0.
+./scripts/run_backend.sh
+
+# 2. Frontend in LAN mode, with HTTPS and the API proxied through it.
+cd frontend && npm run dev:lan
 ```
 
-On the second laptop, open `http://<first-laptop-ip>:5173`.
+Vite prints two addresses. Take the **Network** one, for example:
 
-> **This will not get camera access**, and the reason is not a bug in
-> BridgeTalk. Browsers only grant `getUserMedia` in a *secure context* — HTTPS,
-> or `localhost`. A plain `http://192.168.x.x` origin is neither. The workarounds
-> are an HTTPS tunnel (e.g. `ngrok http 5173`), a self-signed certificate via
-> `@vitejs/plugin-basic-ssl`, or Chrome's
-> `--unsafely-treat-insecure-origin-as-secure` flag. For a review demo, two
-> windows on one machine is the reliable path.
+```
+  ➜  Local:   https://localhost:5173/
+  ➜  Network: https://192.168.1.42:5173/
+```
+
+```bash
+# 3. Allow that origin in the repository-root .env, then restart the backend.
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,https://192.168.1.42:5173
+```
+
+4. On the **second device**, open the Network address. The browser will warn
+   about the self-signed certificate — choose **Advanced → Proceed**. This is
+   expected: the certificate is generated locally and signed by nobody.
+5. Sign in as a different user on each device, create a meeting on one, join by
+   code on the other.
+
+**Notes**
+
+- Both devices must be on the **same Wi-Fi**, and some guest networks block
+  device-to-device traffic entirely — WebRTC will not connect there, and no
+  amount of configuration fixes it without a TURN server.
+- The certificate must be accepted **once per device**.
+- `BRIDGETALK_BACKEND` overrides the proxy target if the API is not on
+  `127.0.0.1:8000`.
+- **None of this touches the production build.** `vite build` is unaffected, and
+  `npm run dev` still serves plain HTTP on localhost only.
+
+### Two participants on one laptop — still fine for captions
+
+For sign-to-text and the caption pipeline, two windows on one machine is the
+quickest path and is what the acceptance checks assume. Use it for anything
+except interview mode and speech.
 
 ---
 

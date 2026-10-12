@@ -10,19 +10,26 @@
     "preview": "vite preview",
     "lint": "eslint src --ext js,jsx",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "compare:profiles": "node scripts/compare-profiles.mjs",
+    "compare:profiles:offline": "node scripts/compare-profiles.mjs --block-fonts",
+    "dev:lan": "BRIDGETALK_LAN=1 vite"
   },
   "dependencies": {
+    "@fontsource/roboto": "5.1.0",
     "@mediapipe/tasks-vision": "0.10.18",
+    "material-symbols": "0.27.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-router-dom": "7.18.2"
   },
   "devDependencies": {
+    "@playwright/test": "1.49.1",
     "@testing-library/dom": "10.4.0",
     "@testing-library/react": "16.1.0",
     "@types/react": "18.3.17",
     "@types/react-dom": "18.3.5",
+    "@vitejs/plugin-basic-ssl": "2.1.0",
     "@vitejs/plugin-react": "5.1.1",
     "@vitest/coverage-v8": "2.1.9",
     "autoprefixer": "10.4.20",
@@ -31,6 +38,8 @@
     "eslint-plugin-react-hooks": "4.6.2",
     "eslint-plugin-react-refresh": "0.4.16",
     "jsdom": "25.0.1",
+    "pixelmatch": "6.0.0",
+    "pngjs": "7.0.0",
     "postcss": "8.5.26",
     "tailwindcss": "3.4.17",
     "vite": "7.3.6",

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { SIGN } from '../config/recognition';
+import { CAPTIONS, SIGN } from '../config/recognition';
+import { createInterimThrottle } from '../utils/interimThrottle';
 import { newSegmentId } from './useCaptionStore';
 
 /**
@@ -99,7 +100,13 @@ export function useSignCaptions({
     return total / flat.length;
   }, []);
 
-  const emit = useCallback((text, isFinal) => {
+  /**
+   * Put one caption on the wire. No throttling here — `emit` decides that.
+   *
+   * The segment id is read at SEND time, not when the update was queued, so a
+   * coalesced interim always belongs to the segment that is still open.
+   */
+  const sendCaption = useCallback((text, isFinal) => {
     if (!segmentRef.current) segmentRef.current = newSegmentId('sg');
     onCaptionRef.current?.({
       segmentId: segmentRef.current,
@@ -109,6 +116,41 @@ export function useSignCaptions({
       confidence: bestRef.current?.confidence ?? null,
     });
   }, []);
+
+  /**
+   * Interim updates are throttled; finals never are.
+   *
+   * Each committed word or letter is sent immediately as an interim update of
+   * the open segment, so the other participant reads text while the signer is
+   * still going rather than only after the pause. A fast fingerspeller can
+   * commit several letters a second, and each one is a socket message
+   * broadcast to the room, so the rate is capped at
+   * CAPTIONS.SIGN_INTERIM_THROTTLE_MS (200 ms = 5/second).
+   *
+   * The throttle COALESCES rather than drops — see utils/interimThrottle.js.
+   * An interim carries the full current text, so discarding the last one
+   * before a pause would leave the other side a word short and make the final
+   * appear to jump.
+   */
+  const throttleRef = useRef(null);
+  if (throttleRef.current === null) {
+    throttleRef.current = createInterimThrottle({
+      intervalMs: CAPTIONS.SIGN_INTERIM_THROTTLE_MS,
+      send: (text, isFinal) => sendCaption(text, isFinal),
+    });
+  }
+
+  // Drop anything queued on unmount or when recognition is switched off, so a
+  // pending interim cannot fire into a segment that no longer exists.
+  useEffect(() => () => throttleRef.current?.reset(), []);
+
+  const emit = useCallback(
+    (text, isFinal) => {
+      if (isFinal) throttleRef.current.flush(text);
+      else throttleRef.current.push(text);
+    },
+    [],
+  );
 
   const commitToken = useCallback(
     (token, confidence) => {

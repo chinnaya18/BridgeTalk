@@ -75,6 +75,44 @@ export const SIGN = {
   MOTION_LOOKBACK_FRAMES: 20,
 };
 
+/**
+ * How captions are DISPLAYED. Nothing here affects the caption protocol, the
+ * database, or how segments are saved — it is presentation only.
+ */
+export const CAPTIONS = {
+  // A speaker's block stays visible this long after their last update, then
+  // fades out. Google Meet's captions behave this way: the text lingers long
+  // enough to finish reading, then clears itself rather than accumulating.
+  BLOCK_TTL_MS: 5000,
+
+  // How long the fade-out itself takes, once the TTL has elapsed.
+  BLOCK_FADE_MS: 600,
+
+  // At most this many speaker blocks on screen; the oldest is dropped first.
+  // Two is the specified number, and it is also the most that fits in the
+  // 140px rail without either block losing its third line.
+  MAX_VISIBLE_BLOCKS: 2,
+
+  // The paragraph is clamped to this many lines. Older lines scroll up and out,
+  // so the newest words always sit in the same place on screen.
+  VISIBLE_LINES: 3,
+
+  // A gap longer than this between two segments from the SAME speaker starts a
+  // new block rather than continuing the paragraph. It is the TTL by
+  // definition: if the previous block has faded out, there is nothing to
+  // continue, so the next thing they say must open a fresh one.
+  //
+  // Any pause SHORTER than this appends to the same paragraph — which is the
+  // whole point of Bug 1. A pause must never start a new line.
+  BLOCK_CONTINUE_WINDOW_MS: 5000,
+
+  // Interim sign updates are throttled to this interval so a fast signer
+  // cannot flood the socket. Finals are never throttled, and the throttle is
+  // trailing-edge and coalescing, so the newest text is always delivered —
+  // no word can be dropped. 200ms is 5 updates a second, as specified.
+  SIGN_INTERIM_THROTTLE_MS: 200,
+};
+
 export const SPEECH = {
   // Web Speech restarts: bounded so a failing recogniser cannot busy-loop,
   // and refunded after a healthy run so a long meeting does not exhaust it.

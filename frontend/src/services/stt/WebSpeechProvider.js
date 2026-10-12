@@ -51,6 +51,10 @@ export class WebSpeechProvider extends SttProvider {
     this._restarts = 0;
     this._restartTimer = null;
     this._startedAt = 0;
+    // The last interim text sent for the currently open segment, or '' when
+    // there is none outstanding. Used to rescue words if the session ends
+    // before delivering its final — see `onend`.
+    this._pendingInterim = '';
     this._state = 'idle';
   }
 
@@ -118,6 +122,9 @@ export class WebSpeechProvider extends SttProvider {
           // transcript with half-sentences that were never said.
           const text = alternative.transcript.trim();
           if (text) {
+            // This utterance is settled, so there is no longer an outstanding
+            // interim to rescue if the session ends. See `onend`.
+            this._pendingInterim = '';
             this.onFinal(
               text,
               // Chrome reports 0 for confidence on many results; null is
@@ -133,7 +140,12 @@ export class WebSpeechProvider extends SttProvider {
         }
       }
 
-      if (interim.trim()) this.onInterim(interim.trim());
+      if (interim.trim()) {
+        // Retained so a session that ends before delivering its final can
+        // still commit what was heard. See `onend`.
+        this._pendingInterim = interim.trim();
+        this.onInterim(this._pendingInterim);
+      }
     };
 
     recognition.onerror = (event) => {
@@ -176,6 +188,25 @@ export class WebSpeechProvider extends SttProvider {
         return;
       }
 
+      // PROBLEM: words lost across a restart.
+      //
+      // Chrome usually delivers a final result before `onend`, but not always —
+      // a network blip or a service hiccup can end the session with an interim
+      // still outstanding. That interim had been sent as a non-final update of
+      // an OPEN segment, so the next session's interims would REPLACE it, and
+      // the words heard just before the restart would vanish from both screens
+      // and from the transcript.
+      //
+      // Committing it as a final here closes that segment properly: the text is
+      // kept, one transcript row is written, and the next session starts a new
+      // segment id. Confidence is null because none was reported for an
+      // interim, and null is honest where 0 would read as "certainly wrong".
+      if (this._pendingInterim) {
+        const rescued = this._pendingInterim;
+        this._pendingInterim = '';
+        this.onFinal(rescued, null, Date.now());
+      }
+
       // PROBLEM: auto-stop after silence. Chrome fires `onend` after a pause
       // even with continuous=true, so without restarting, captions die after
       // the first quiet stretch and the user has no idea why.
@@ -216,6 +247,9 @@ export class WebSpeechProvider extends SttProvider {
 
   _teardown() {
     clearTimeout(this._restartTimer);
+    // A deliberate stop detaches onend below, so the interim rescue there will
+    // not run. Clear it so a stale value cannot leak into a later session.
+    this._pendingInterim = '';
     const recognition = this._recognition;
     this._recognition = null;
 

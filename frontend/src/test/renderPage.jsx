@@ -62,6 +62,8 @@ const MEETING = {
     },
   ],
   caption_count: 2,
+  // The server's COUNT(DISTINCT user_id), including the host.
+  participant_count: 2,
 };
 
 const TRANSCRIPT = [

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import (
+    UniqueConstraint,
     Boolean,
     DateTime,
     Enum,
@@ -101,11 +102,22 @@ class Meeting(Base):
 
 
 class MeetingParticipant(Base):
-    """Join table recording who was in a meeting and when.
+    """Who was in a meeting, and when. ONE ROW PER (meeting, user).
 
-    This is a log, not a set: rejoining after a dropped connection writes a new
-    row rather than mutating the old one, so the attendance history stays
-    truthful about disconnections.
+    This used to be an append-only log: rejoining after a dropped connection
+    wrote a new row rather than mutating the old one. The intent was to keep
+    the history of disconnections, but nothing ever displayed that history —
+    while the participant count on Home and History was `len(participants)`, a
+    ROW count rather than a count of people. On the development database that
+    meant 207 rows for 72 distinct (meeting, user) pairs, including a meeting
+    reporting seventeen participants for a single user.
+
+    So it is now a set, enforced by a UNIQUE constraint. `joined_at` keeps the
+    person's EARLIEST arrival and `left_at` is NULL while they are present.
+    `database/migrations/003_unique_participant.sql` merges existing rows.
+
+    The trade, stated plainly: how many times somebody reconnected is no longer
+    recorded.
     """
 
     __tablename__ = "meeting_participants"
@@ -130,7 +142,15 @@ class MeetingParticipant(Base):
 
     # "Is this user currently in this meeting?" is asked on every join request,
     # and it filters on both columns at once — hence the composite index.
-    __table_args__ = (Index("ix_participant_meeting_user", "meeting_id", "user_id"),)
+    #
+    # The UNIQUE constraint is what actually prevents duplicates. The join
+    # endpoint upserts, but an application-level check alone loses a race
+    # between two simultaneous joins from the same user — two tabs, or a retry
+    # after a dropped response.
+    __table_args__ = (
+        Index("ix_participant_meeting_user", "meeting_id", "user_id"),
+        UniqueConstraint("meeting_id", "user_id", name="uq_participant_meeting_user"),
+    )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging convenience
         return f"<MeetingParticipant meeting={self.meeting_id} user={self.user_id}>"

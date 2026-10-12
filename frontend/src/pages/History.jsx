@@ -181,6 +181,8 @@ export default function History() {
 function HistoryRow({ meeting, onOpen }) {
   const duration = formatDuration(meeting.started_at, meeting.ended_at);
   const participants = meeting.participants ?? [];
+  // The SERVER's COUNT(DISTINCT user_id), including the host. See Home.jsx.
+  const participantCount = meeting.participant_count ?? participants.length;
   const captionCount = meeting.caption_count ?? 0;
 
   const handleKeyDown = (event) => {
@@ -222,7 +224,7 @@ function HistoryRow({ meeting, onOpen }) {
           </p>
 
           <div className="mt-2.5 flex items-center gap-2">
-            {participants.length > 0 ? (
+            {participantCount > 0 ? (
               <>
                 <div className="flex items-center">
                   {participants.slice(0, 5).map((participant, index) => (
@@ -236,9 +238,19 @@ function HistoryRow({ meeting, onOpen }) {
                   ))}
                 </div>
                 <span className="text-xs text-light-muted">
-                  {participants.length === 1
-                    ? participants[0].user?.name
-                    : `${participants.length} participants`}
+                  {/* The avatars are capped at five; the count is the real
+                      total, so an overflow is shown explicitly rather than the
+                      number silently disagreeing with the faces. */}
+                  {participantCount > 5 ? (
+                    <>
+                      +{participantCount - 5} ·{' '}
+                      {participantCount} participants
+                    </>
+                  ) : participantCount === 1 ? (
+                    participants[0]?.user?.name ?? '1 participant'
+                  ) : (
+                    `${participantCount} participants`
+                  )}
                 </span>
               </>
             ) : (

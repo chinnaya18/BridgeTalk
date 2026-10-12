@@ -71,6 +71,26 @@ class MeetingDetail(MeetingPublic):
 
     participants: list[ParticipantPublic] = []
 
+    # The number of DISTINCT users who joined, including the host.
+    #
+    # Computed by the server with COUNT(DISTINCT user_id) rather than left to
+    # each client to derive from `participants`. Every surface — Home's recent
+    # cards, History rows, the transcript header and the meeting-ended page —
+    # now reads this one field, so they cannot disagree.
+    #
+    # `len(participants)` was what they all used before, and it was a ROW count:
+    # the attendance table was append-only, so somebody who reconnected three
+    # times was reported as three participants. The rows are now unique per
+    # (meeting, user), so this and `len(participants)` agree — but the explicit
+    # count is kept because it states the intent and stays correct if the
+    # participant list is ever paginated or trimmed.
+    participant_count: int = Field(
+        default=0,
+        description=(
+            "Distinct users who joined this meeting, including the host."
+        ),
+    )
+
 
 class MeetingSummary(MeetingDetail):
     """A meeting as it appears in the history list and on the home page.

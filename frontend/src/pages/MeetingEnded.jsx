@@ -67,6 +67,18 @@ export default function MeetingEnded() {
         {meeting ? (
           <p className="mt-2 text-sm text-light-muted">
             {meeting.title} · {code}
+            {/* The SERVER's COUNT(DISTINCT user_id), the same number Home,
+                History and the transcript header show. Deriving it from
+                `participants.length` here is how four surfaces came to
+                disagree: the attendance table was append-only, so a
+                reconnecting participant was counted once per reconnection. */}
+            {meeting.participant_count ? (
+              <>
+                {' · '}
+                {meeting.participant_count}{' '}
+                {meeting.participant_count === 1 ? 'participant' : 'participants'}
+              </>
+            ) : null}
           </p>
         ) : null}
 

@@ -331,6 +331,12 @@ export default function Home() {
 function RecentMeetingCard({ meeting }) {
   const duration = formatDuration(meeting.started_at, meeting.ended_at);
   const participants = meeting.participants ?? [];
+  // The SERVER's COUNT(DISTINCT user_id), including the host — not
+  // `participants.length`. The attendance table was append-only, so a
+  // participant who reconnected three times used to be counted three times.
+  // The avatars below are capped, so the count and the faces are shown
+  // together with a "+N" for the overflow.
+  const participantCount = meeting.participant_count ?? participants.length;
 
   return (
     <div className="card p-4 transition-shadow hover:shadow-sm">
@@ -362,12 +368,18 @@ function RecentMeetingCard({ meeting }) {
               <Avatar name={participant.user?.name ?? ''} size={26} />
             </span>
           ))}
-          {participants.length > 4 ? (
-            <span className="ml-1.5 text-xs text-light-muted">+{participants.length - 4}</span>
+          {participantCount > 4 ? (
+            <span className="ml-1.5 text-xs text-light-muted">
+              +{participantCount - 4}
+            </span>
           ) : null}
-          {participants.length === 0 ? (
-            <span className="text-xs text-light-muted">No participants recorded</span>
-          ) : null}
+          {participantCount === 0 ? (
+            <span className="text-xs text-light-muted">No one joined</span>
+          ) : (
+            <span className="ml-2 text-xs text-light-muted">
+              {participantCount} {participantCount === 1 ? 'participant' : 'participants'}
+            </span>
+          )}
         </div>
 
         <Link

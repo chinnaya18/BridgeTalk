@@ -567,3 +567,138 @@ comments say.
 | Build | succeeded | **succeeded** |
 
 ---
+
+## Fix 5 — Bug 4: the participant count on Home and History was wrong
+
+### Reproduced, against the live database
+
+```sql
+SELECT COUNT(*), COUNT(DISTINCT meeting_id, user_id) FROM meeting_participants;
+-- 207 rows, 72 distinct (meeting, user) pairs  ->  135 duplicates
+```
+
+| Meeting | Rows | Distinct users |
+|---|---|---|
+| 134 | **17** | **1** |
+| 114 | 14 | 2 |
+| 143 | 8 | 2 |
+| 110 | 8 | 2 |
+
+Eight meetings affected. One reported **seventeen participants for a single
+user**.
+
+### Root cause
+
+Of the four candidates the brief listed, exactly one applied:
+
+| Candidate | Finding |
+|---|---|
+| **Counts rows instead of distinct users** | **Yes — this is the cause** |
+| Includes duplicates from rejoining | Yes, the same cause: that is where the duplicate rows came from |
+| Leaves out the host | **No.** The host joins through the lobby like everyone else and appeared in the rows (`host_rows=3` on recent meetings) |
+| Counts only people still present | **No.** `left_at` was never filtered |
+
+`meeting_participants` was deliberately an **append-only log** — the schema
+comment said so — so `POST /join` inserted a new row every time. The frontend
+then drew the number from `participants.length`, a **row** count. A participant
+who reconnected three times was three participants.
+
+The intent behind the log was to keep the history of disconnections. **Nothing
+ever displayed that history, while the wrong count was displayed in four
+places.**
+
+### Fix
+
+**Definition applied:** the participant count is the number of **distinct users
+who joined, including the host**, however many times each one rejoined.
+
+| Layer | Change |
+|---|---|
+`database/migrations/003_unique_participant.sql` *(new)* | Merges existing duplicates, then adds `UNIQUE KEY uq_participant_meeting_user (meeting_id, user_id)` |
+`database/schema.sql` | The same UNIQUE key, so a fresh install needs no migration |
+`backend/app/models/meeting.py` | `UniqueConstraint` on the ORM model |
+`backend/app/api/meetings.py` → `join_meeting` | **Upserts**: an existing row has its `left_at` cleared and keeps its original `joined_at`. `IntegrityError` is caught and the winning row reused, for two simultaneous joins from the same user |
+`backend/app/schemas/meeting.py` | `MeetingDetail.participant_count` — so `MeetingSummary` inherits it too |
+`backend/app/api/meetings.py` | `_participant_count()` using **`COUNT(DISTINCT user_id)`**, and `_detail_with_count()` — **one builder used by every endpoint returning a `MeetingDetail`**, so no surface can forget it |
+History endpoint | One **grouped** `COUNT(DISTINCT user_id)` for the whole page, keeping the query count flat at five regardless of how many meetings |
+
+**The migration's merge rule**, stated so nothing is lost silently:
+
+- the surviving row is the one with the lowest `id`;
+- `joined_at` becomes the **earliest** across the group — when the person
+  actually arrived;
+- `left_at` becomes **NULL if any row was still open** (they are present),
+  otherwise the **latest** departure;
+- everything else is deleted.
+
+It is idempotent: re-running merges nothing, and the index is guarded through
+`information_schema` because MySQL has no `ADD UNIQUE KEY IF NOT EXISTS`.
+
+**What is lost, stated plainly:** how many times somebody reconnected is no
+longer recorded. That is the trade, and it was never shown anywhere.
+
+**Applied to the live database:**
+
+```
+207 rows -> 72 rows, 0 duplicates, unique index present
+```
+
+### The same number on all four surfaces
+
+Each one previously derived it from `participants.length`. All four now read
+`participant_count`, with a fallback to the array length if an older backend
+sends no field:
+
+| Surface | File |
+|---|---|
+| Home — recent meeting cards | `pages/Home.jsx` |
+| History — rows | `pages/History.jsx` |
+| Transcript — header | `pages/Transcript.jsx` |
+| Meeting-ended page | `pages/MeetingEnded.jsx` |
+
+**Avatars match the count.** Home caps the faces at 4, History at 5, the
+transcript header at 6, and each shows the overflow explicitly as `+N` beside
+the total — so the number and the faces can never silently disagree.
+
+### The People panel
+
+Left as it is, per the brief: it shows who is **currently** in the meeting, which
+is a different number. It now carries the label **"Currently in this meeting"**
+so it cannot be mistaken for the total.
+
+### Tests
+
+`backend/tests/test_meetings.py` — **10 added**, covering every scenario the
+brief names:
+
+| Scenario | Test |
+|---|---|
+| Host alone | `test_participant_count_host_alone` |
+| Host plus one guest | `test_participant_count_host_plus_one_guest` |
+| Guest leaving and rejoining twice | `test_participant_count_with_a_guest_leaving_and_rejoining_twice` |
+| Host reconnecting | `test_participant_count_with_the_host_reconnecting` |
+| A meeting the caller only attended | `test_participant_count_for_a_meeting_the_caller_only_attended` |
+| — plus | a meeting the host never entered counts **0**; the count is identical on every surface; **the UNIQUE constraint prevents duplicate rows**; rejoining reuses the row and keeps the original `joined_at`; rejoining five times still counts one |
+
+`frontend/src/test/pages.test.jsx` — **4 added**. Each stubs a `participants`
+array **shorter** than `participant_count`, so a surface that still derived the
+number from the array would show the wrong one. History, Home and the
+meeting-ended page are checked, plus the fallback when no count is sent.
+
+### One baseline test intentionally changed
+
+`test_rejoining_writes_a_new_attendance_row` asserted the **opposite** —
+that rejoining wrote a new row. Rewritten as
+`test_rejoining_reuses_the_attendance_row`, which also asserts the original
+`joined_at` survives the merge.
+
+### Suites after this fix
+
+| Suite | Baseline | Now |
+|---|---|---|
+| Backend | 258 passed, 2 skipped | **276 passed, 2 skipped** |
+| Lint | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend tests | 13 passed | **67 passed** |
+| Build | succeeded | **succeeded** |
+
+---

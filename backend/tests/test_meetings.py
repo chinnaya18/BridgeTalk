@@ -124,21 +124,53 @@ def test_second_joiner_is_not_the_first_participant(client, auth_headers, second
     assert response.json()["is_first_participant"] is False
 
 
-def test_rejoining_writes_a_new_attendance_row(client, auth_headers, meeting):
-    """A dropped connection must stay visible in the record.
+def test_rejoining_reuses_the_attendance_row(client, auth_headers, meeting):
+    """ONE row per (meeting, user), however many times they rejoin.
 
-    Reusing the original row would quietly erase the disconnection, which makes
-    the attendance log a nicer story than what actually happened.
+    This test used to assert the opposite — that rejoining wrote a NEW row, to
+    keep a dropped connection visible in the record. That intent was never
+    displayed anywhere, and the row count WAS displayed: as the meeting's
+    participant count on Home and History. So someone who reconnected three
+    times was reported as three participants.
+
+    What the merged row keeps: the earliest arrival, and `left_at` cleared
+    because they are back. What is lost: how many times they reconnected.
     """
     code = meeting["code"]
-    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+    first = client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+    original_joined_at = first.json()["meeting"]["participants"][0]["joined_at"]
+
     client.post(f"/api/meetings/{code}/leave", headers=auth_headers)
     response = client.post(f"/api/meetings/{code}/join", headers=auth_headers)
 
     participants = response.json()["meeting"]["participants"]
-    assert len(participants) == 2
-    assert participants[0]["left_at"] is not None
-    assert participants[1]["left_at"] is None
+    assert len(participants) == 1, "rejoining created a second row"
+    assert participants[0]["left_at"] is None, "they are back, so left_at must be clear"
+    assert participants[0]["joined_at"] == original_joined_at, (
+        "the original arrival time must be kept"
+    )
+
+
+def test_rejoining_many_times_still_counts_one_participant(
+    client, auth_headers, second_headers, meeting
+):
+    """The reported bug, directly: a reconnecting guest inflated the count.
+
+    The development database held 207 attendance rows for 72 distinct
+    (meeting, user) pairs, including a meeting reporting seventeen participants
+    for a single user.
+    """
+    code = meeting["code"]
+    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+
+    for _ in range(5):
+        client.post(f"/api/meetings/{code}/join", headers=second_headers)
+        client.post(f"/api/meetings/{code}/leave", headers=second_headers)
+    client.post(f"/api/meetings/{code}/join", headers=second_headers)
+
+    detail = client.get(f"/api/meetings/{code}", headers=auth_headers).json()
+    assert detail["participant_count"] == 2, detail["participant_count"]
+    assert len(detail["participants"]) == 2
 
 
 def test_join_is_case_insensitive(client, auth_headers, meeting):
@@ -589,3 +621,160 @@ def test_history_search_still_excludes_other_peoples_meetings(
 def test_history_blank_search_lists_everything(client, auth_headers, meeting):
     rows = client.get("/api/meetings/history?q=%20%20", headers=auth_headers).json()
     assert len(rows) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Bug 4 — the participant count
+#
+# Definition: the number of DISTINCT users who joined, INCLUDING the host,
+# however many times each one rejoined.
+# ---------------------------------------------------------------------------
+
+
+def test_participant_count_host_alone(client, auth_headers, meeting):
+    code = meeting["code"]
+    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+
+    detail = client.get(f"/api/meetings/{code}", headers=auth_headers).json()
+    assert detail["participant_count"] == 1
+
+    row = next(
+        item
+        for item in client.get("/api/meetings/history", headers=auth_headers).json()
+        if item["code"] == code
+    )
+    assert row["participant_count"] == 1
+
+
+def test_participant_count_counts_a_meeting_the_host_never_entered_as_zero(
+    client, auth_headers, meeting
+):
+    """Creating a meeting is not attending it.
+
+    The host appears in the count when they JOIN, which they do through the
+    lobby like everyone else. A meeting created and never entered genuinely
+    has no participants.
+    """
+    detail = client.get(f"/api/meetings/{meeting['code']}", headers=auth_headers).json()
+    assert detail["participant_count"] == 0
+    assert detail["participants"] == []
+
+
+def test_participant_count_host_plus_one_guest(
+    client, auth_headers, second_headers, meeting
+):
+    code = meeting["code"]
+    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+    client.post(f"/api/meetings/{code}/join", headers=second_headers)
+
+    detail = client.get(f"/api/meetings/{code}", headers=auth_headers).json()
+    assert detail["participant_count"] == 2
+    # The avatars drawn from `participants` must match the count, or the UI
+    # shows one number and a different set of faces.
+    assert len(detail["participants"]) == detail["participant_count"]
+
+
+def test_participant_count_with_a_guest_leaving_and_rejoining_twice(
+    client, auth_headers, second_headers, meeting
+):
+    code = meeting["code"]
+    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+
+    for _ in range(2):
+        client.post(f"/api/meetings/{code}/join", headers=second_headers)
+        client.post(f"/api/meetings/{code}/leave", headers=second_headers)
+    client.post(f"/api/meetings/{code}/join", headers=second_headers)
+
+    detail = client.get(f"/api/meetings/{code}", headers=auth_headers).json()
+    assert detail["participant_count"] == 2
+    assert len(detail["participants"]) == 2
+
+
+def test_participant_count_with_the_host_reconnecting(
+    client, auth_headers, second_headers, meeting
+):
+    code = meeting["code"]
+    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+    client.post(f"/api/meetings/{code}/join", headers=second_headers)
+
+    # The host's laptop sleeps and comes back, three times.
+    for _ in range(3):
+        client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+
+    detail = client.get(f"/api/meetings/{code}", headers=auth_headers).json()
+    assert detail["participant_count"] == 2
+
+
+def test_participant_count_for_a_meeting_the_caller_only_attended(
+    client, auth_headers, second_headers, meeting
+):
+    """The guest sees the same number the host sees.
+
+    The count is computed server-side from the attendance rows, so it does not
+    depend on who is asking.
+    """
+    code = meeting["code"]
+    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+    client.post(f"/api/meetings/{code}/join", headers=second_headers)
+
+    as_host = client.get(f"/api/meetings/{code}", headers=auth_headers).json()
+    as_guest = client.get(f"/api/meetings/{code}", headers=second_headers).json()
+    assert as_host["participant_count"] == as_guest["participant_count"] == 2
+
+    guest_history = client.get("/api/meetings/history", headers=second_headers).json()
+    row = next(item for item in guest_history if item["code"] == code)
+    assert row["participant_count"] == 2
+
+
+def test_participant_count_is_the_same_on_every_surface(
+    client, auth_headers, second_headers, meeting
+):
+    """Home, History, the transcript header and the ended page read ONE field.
+
+    They each used to derive it from `len(participants)`, which is how they
+    could disagree. This asserts the three server responses that feed those
+    four surfaces all report the same number.
+    """
+    code = meeting["code"]
+    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+    for _ in range(3):
+        client.post(f"/api/meetings/{code}/join", headers=second_headers)
+
+    detail = client.get(f"/api/meetings/{code}", headers=auth_headers).json()
+    history_row = next(
+        item
+        for item in client.get("/api/meetings/history", headers=auth_headers).json()
+        if item["code"] == code
+    )
+    joined = client.post(f"/api/meetings/{code}/join", headers=auth_headers).json()
+
+    assert (
+        detail["participant_count"]
+        == history_row["participant_count"]
+        == joined["meeting"]["participant_count"]
+        == 2
+    )
+
+
+def test_a_second_join_cannot_create_a_duplicate_row(
+    client, auth_headers, second_headers, meeting, db_session
+):
+    """The UNIQUE constraint is the real guarantee, not the upsert lookup.
+
+    An application-level check alone loses a race between two simultaneous
+    joins from the same user — two tabs, or a retry after a dropped response.
+    """
+    from sqlalchemy import select
+
+    from app.models.meeting import Meeting, MeetingParticipant
+
+    code = meeting["code"]
+    for _ in range(4):
+        client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+        client.post(f"/api/meetings/{code}/join", headers=second_headers)
+
+    rows = db_session.scalars(
+        select(MeetingParticipant).join(Meeting).where(Meeting.code == code)
+    ).all()
+    pairs = {(row.meeting_id, row.user_id) for row in rows}
+    assert len(rows) == len(pairs) == 2, f"{len(rows)} rows for {len(pairs)} pairs"

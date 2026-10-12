@@ -356,3 +356,58 @@ describe('Bug 3 — interview mode reaches the participant', () => {
     expect(screen.queryByText(/The host has turned on interview mode/i)).toBeNull();
   });
 });
+
+describe('Bug 4 — the participant count comes from the server', () => {
+  /**
+   * The count used to be `participants.length`, and the attendance table was
+   * append-only — so a participant who reconnected three times was reported as
+   * three participants. The fix computes COUNT(DISTINCT user_id) server-side
+   * and every surface reads that one field.
+   *
+   * These stubs deliberately give a participants array SHORTER than
+   * participant_count. If a surface still derived the number from the array it
+   * would show the wrong one, so this proves the field is what is read.
+   */
+  const soloList = [MEETING.participants[0]];
+
+  it('History shows the server count, not the length of the array', async () => {
+    installApiStub({
+      meeting: { ...MEETING, participants: soloList, participant_count: 4 },
+    });
+
+    renderPage(<History />, { path: '/history' });
+
+    expect(await screen.findByText('4 participants')).toBeTruthy();
+    expect(screen.queryByText('1 participant')).toBeNull();
+  });
+
+  it('Home shows the server count', async () => {
+    installApiStub({
+      meeting: { ...MEETING, participants: soloList, participant_count: 3 },
+    });
+
+    renderPage(<Home />, { path: '/' });
+    await screen.findByText('Project review');
+
+    expect(await screen.findByText(/3 participants/)).toBeTruthy();
+  });
+
+  it('the meeting-ended page shows the server count', async () => {
+    installApiStub({
+      meeting: { ...MEETING, participants: soloList, participant_count: 2 },
+    });
+
+    renderPage(<MeetingEnded />, { path: '/ended/:code', entry: '/ended/K7Q-2M4' });
+
+    expect(await screen.findByText(/2 participants/)).toBeTruthy();
+  });
+
+  it('falls back to the array length when the server sends no count', async () => {
+    // Defensive: an older backend, or a cached response.
+    const { participant_count: _omitted, ...withoutCount } = MEETING;
+    installApiStub({ meeting: { ...withoutCount, participants: MEETING.participants } });
+
+    renderPage(<History />, { path: '/history' });
+    expect(await screen.findByText('2 participants')).toBeTruthy();
+  });
+});

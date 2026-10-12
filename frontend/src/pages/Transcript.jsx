@@ -248,7 +248,15 @@ export default function Transcript() {
                   ))}
                 </div>
                 <span className="text-xs text-light-muted">
-                  {meeting.participants.map((p) => p.user?.name).filter(Boolean).join(', ')}
+                  {/* Names when they fit, otherwise the SERVER's count — the
+                      same `participant_count` Home and History show, so the
+                      four surfaces cannot disagree. */}
+                  {(meeting.participant_count ?? meeting.participants.length) > 6
+                    ? `${meeting.participant_count} participants`
+                    : meeting.participants
+                        .map((p) => p.user?.name)
+                        .filter(Boolean)
+                        .join(', ')}
                 </span>
               </div>
             ) : null}

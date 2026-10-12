@@ -92,9 +92,19 @@ CREATE TABLE IF NOT EXISTS meetings (
 -- ---------------------------------------------------------------------------
 -- meeting_participants
 -- ---------------------------------------------------------------------------
--- A log, not a set. Rejoining after a dropped connection inserts a NEW row
--- instead of updating the old one, so the attendance history stays truthful
--- about disconnections.
+-- ONE ROW PER (meeting, user). This was an append-only log, so a participant
+-- who reconnected appeared several times — and the participant count shown on
+-- Home and History was a ROW count, not a count of people. On the development
+-- database that was 207 rows for 72 distinct pairs, including a meeting showing
+-- seventeen participants for one user.
+--
+-- The trade is stated plainly: collapsing to one row discards HOW MANY times
+-- someone reconnected. That was never displayed anywhere, while the wrong count
+-- was displayed in four places. `joined_at` keeps the earliest arrival and
+-- `left_at` is NULL while they are present.
+--
+-- See database/migrations/003_unique_participant.sql for the merge applied to
+-- existing data.
 CREATE TABLE IF NOT EXISTS meeting_participants (
   id         INT AUTO_INCREMENT PRIMARY KEY,
   meeting_id INT      NOT NULL,
@@ -107,6 +117,10 @@ CREATE TABLE IF NOT EXISTS meeting_participants (
   -- "Is this user currently in this meeting?" filters on both columns at
   -- once, so a composite index serves it in one lookup.
   KEY ix_participant_meeting_user (meeting_id, user_id),
+  -- UNIQUE, not an ordinary index. The application upserts on join, but this
+  -- is the real guarantee: an application-level check alone loses a race
+  -- between two simultaneous joins from the same user (two tabs, or a retry).
+  UNIQUE KEY uq_participant_meeting_user (meeting_id, user_id),
 
   CONSTRAINT fk_participants_meeting
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,

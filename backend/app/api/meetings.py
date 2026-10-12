@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.deps import CurrentUser, DbSession
@@ -66,6 +67,39 @@ def generate_meeting_code(db: Session) -> str:
     raise HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="Could not allocate a unique meeting code, please retry",
+    )
+
+
+def _participant_count(db: Session, meeting_id: int) -> int:
+    """Distinct users who joined a meeting, including the host.
+
+    COUNT(DISTINCT user_id), not a row count and not `len(participants)`.
+    The attendance table is now unique per (meeting, user) so the two agree,
+    but the explicit count states the intent and stays correct if the
+    participant list is ever paginated or trimmed.
+
+    The host is included when they joined — which they do, through the lobby,
+    like everyone else. A host who created a meeting and never entered it is
+    genuinely not a participant of it.
+    """
+    return int(
+        db.scalar(
+            select(func.count(func.distinct(MeetingParticipant.user_id))).where(
+                MeetingParticipant.meeting_id == meeting_id
+            )
+        )
+        or 0
+    )
+
+
+def _detail_with_count(db: Session, meeting: Meeting) -> MeetingDetail:
+    """MeetingDetail with its participant_count filled in.
+
+    One builder, used by every endpoint that returns a MeetingDetail, so no
+    surface can forget the count and fall back to the default of 0.
+    """
+    return MeetingDetail.model_validate(meeting).model_copy(
+        update={"participant_count": _participant_count(db, meeting.id)}
     )
 
 
@@ -222,6 +256,7 @@ def meeting_history(
       2. `selectinload(Meeting.participants)` — one IN query for all of them
       3. `.selectinload(MeetingParticipant.user)` — one IN query for all users
       4. one grouped COUNT over transcripts
+      5. one grouped COUNT(DISTINCT user_id) over participants
 
     The grouped count is the part that is easy to get wrong. One
     `len(meeting.transcripts)` per meeting would load every caption row of
@@ -268,21 +303,45 @@ def meeting_history(
     if not meetings:
         return []
 
+    meeting_ids = [meeting.id for meeting in meetings]
+
     counts = dict(
         db.execute(
             select(Transcript.meeting_id, func.count(Transcript.id))
-            .where(Transcript.meeting_id.in_([meeting.id for meeting in meetings]))
+            .where(Transcript.meeting_id.in_(meeting_ids))
             .group_by(Transcript.meeting_id)
         ).all()
     )
 
+    # Distinct users per meeting, including the host, in ONE grouped query —
+    # not one per meeting, and not `len(participants)`.
+    #
+    # `len(participants)` is what every surface used before, and it was a ROW
+    # count: the attendance table was append-only, so somebody who reconnected
+    # three times was reported as three participants. The rows are unique per
+    # (meeting, user) now, so the two agree — but counting explicitly states
+    # the intent and survives the participant list being trimmed.
+    participant_counts = dict(
+        db.execute(
+            select(
+                MeetingParticipant.meeting_id,
+                func.count(func.distinct(MeetingParticipant.user_id)),
+            )
+            .where(MeetingParticipant.meeting_id.in_(meeting_ids))
+            .group_by(MeetingParticipant.meeting_id)
+        ).all()
+    )
+
     return [
-        # Validated from the ORM object, then copied with the count layered on.
+        # Validated from the ORM object, then copied with the counts layered on.
         # `model_validate` has no `update` argument in pydantic v2 — that is
         # `model_copy` — and setting `meeting.caption_count` instead would make
         # SQLAlchemy treat the instance as having a dirty column.
         MeetingSummary.model_validate(meeting).model_copy(
-            update={"caption_count": counts.get(meeting.id, 0)}
+            update={
+                "caption_count": counts.get(meeting.id, 0),
+                "participant_count": participant_counts.get(meeting.id, 0),
+            }
         )
         for meeting in meetings
     ]
@@ -296,16 +355,25 @@ def get_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Meeting:
     need to see the title before deciding to join. The transcript endpoints
     are the ones that enforce membership.
     """
-    return _load_meeting_by_code(db, code)
+    return _detail_with_count(db, _load_meeting_by_code(db, code))
 
 
 @router.post("/{code}/join", response_model=MeetingJoinResponse, summary="Join a meeting")
 def join_meeting(code: str, db: DbSession, current_user: CurrentUser) -> MeetingJoinResponse:
-    """Join a meeting, recording attendance.
+    """Join a meeting, recording attendance. ONE ROW PER (meeting, user).
 
-    Rejoining after a dropped connection writes a NEW participant row rather
-    than reusing the old one, so the attendance log stays truthful about
-    disconnections instead of quietly pretending they never happened.
+    Rejoining UPDATES the existing row rather than inserting another. It used
+    to insert, which made `meeting_participants` an append-only log — and the
+    participant count shown on Home and History was `len(participants)`, a row
+    count rather than a count of people. A participant who reconnected three
+    times was reported as three participants.
+
+    What the merged row keeps: the EARLIEST `joined_at`, because that is when
+    the person actually arrived, and `left_at` cleared to NULL, because they
+    are here now.
+
+    What is lost, stated plainly: how many times somebody reconnected. Nothing
+    ever displayed that, while the wrong count was displayed in four places.
     """
     meeting = _load_meeting_by_code(db, code)
 
@@ -324,12 +392,47 @@ def join_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Meeting
     if is_first:
         meeting.started_at = now
 
-    db.add(MeetingParticipant(meeting_id=meeting.id, user_id=current_user.id, joined_at=now))
-    db.commit()
+    # Upsert. The UNIQUE constraint on (meeting_id, user_id) is the real
+    # guarantee — this lookup just avoids provoking an IntegrityError for the
+    # ordinary case of someone rejoining.
+    existing = db.scalar(
+        select(MeetingParticipant).where(
+            MeetingParticipant.meeting_id == meeting.id,
+            MeetingParticipant.user_id == current_user.id,
+        )
+    )
+
+    if existing is None:
+        db.add(
+            MeetingParticipant(
+                meeting_id=meeting.id, user_id=current_user.id, joined_at=now
+            )
+        )
+    else:
+        # They are back. Clear the departure; keep the original arrival time.
+        existing.left_at = None
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two simultaneous joins from the same user — two tabs, or a retry
+        # after a dropped response. The constraint did its job; the row that
+        # won is equally correct, so reuse it.
+        db.rollback()
+        existing = db.scalar(
+            select(MeetingParticipant).where(
+                MeetingParticipant.meeting_id == meeting.id,
+                MeetingParticipant.user_id == current_user.id,
+            )
+        )
+        if existing is not None:
+            existing.left_at = None
+            db.commit()
+
     db.refresh(meeting)
 
     return MeetingJoinResponse(
-        meeting=MeetingDetail.model_validate(_load_meeting_by_code(db, code)),
+        meeting=_detail_with_count(db, _load_meeting_by_code(db, code)),
         is_first_participant=is_first,
     )
 
@@ -358,7 +461,7 @@ def leave_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Meetin
     open_row.left_at = datetime.now(timezone.utc)
     db.commit()
 
-    return _load_meeting_by_code(db, code)
+    return _detail_with_count(db, _load_meeting_by_code(db, code))
 
 
 @router.patch(
@@ -427,7 +530,7 @@ async def set_interview_mode(
             )
             db.commit()
             db.refresh(meeting)
-        return _load_meeting_by_code(db, code)
+        return _detail_with_count(db, _load_meeting_by_code(db, code))
 
     meeting.is_interview_mode = True
     # Stamped on switch-on, so focus events recorded earlier in the meeting are
@@ -436,7 +539,7 @@ async def set_interview_mode(
 
     db.commit()
     db.refresh(meeting)
-    fresh = _load_meeting_by_code(db, code)
+    fresh = _detail_with_count(db, _load_meeting_by_code(db, code))
 
     # THE FIX FOR BUG 3. Without this the state reached only the host.
     delivered = await _announce_to_room(
@@ -662,7 +765,7 @@ async def end_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Me
             participant.left_at = now
 
     db.commit()
-    fresh = _load_meeting_by_code(db, code)
+    fresh = _detail_with_count(db, _load_meeting_by_code(db, code))
 
     # Announce the end to the room.
     #

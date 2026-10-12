@@ -573,3 +573,48 @@ Exercising the live API created rows in the development database, left in place
 rather than deleted: `meetings` id 139 (`4T9-7M2`), `meeting_participants`
 id 157, `focus_events` ids 25–26, `transcripts` id 51. That meeting also has
 Interview Mode switched on.
+
+
+---
+
+## Reported bugs 1–5 — fixed
+
+Five bugs from two-participant testing, fixed in order. Full detail, root causes
+and the manual test script are in **`FIXES.md`**.
+
+| Bug | What was wrong | Root cause | Status |
+|---|---|---|---|
+| **1** | Captions shown one line per segment, so a pause started a new line | A *segment* is an utterance boundary, not a line of display. `CaptionRail` mapped store entries one-to-one onto elements | **Fixed.** `utils/captionBlocks.js` groups consecutive segments from one speaker into one continuous paragraph. Display-only |
+| **2** | Each user saw their own captions echoed back | The server broadcasts to everyone including the sender — deliberately — and the rail rendered all of it | **Fixed.** One rule in the display layer: show captions from other participants, never your own. Filtered by speaker, not source |
+| **3** | **Interview mode did not work** | The state reached only the **host**. `MeetingRoom` fetched the meeting once on mount; there was no broadcast and no re-read, so `interviewOn` stayed false on the participant's screen and no enforcement ever ran | **Fixed.** Live broadcast plus room state in the socket handshake. Also made one-way, with a locked Leave, host violation alerts, and a proper teardown on end |
+| **4** | Participant count wrong on Home and History | `meeting_participants` was append-only, so the count was a **row** count. The live database held 207 rows for 72 distinct pairs | **Fixed.** Migration 003 merges duplicates and adds a UNIQUE key; `join_meeting` upserts; `COUNT(DISTINCT user_id)` is computed server-side and read by all four surfaces |
+| **5** | Layout broke in an incognito window | Fonts came from Google's CDN. Measured: the icon font was still loading after **2.5 s** on a warm network and never loaded on a blocked one | **Fixed.** Roboto and Material Symbols self-hosted from npm. Blocking the CDN now changes nothing |
+
+Also fixed on the way: **K-1** (selecting "Browser" as the speech engine crashed
+the meeting), **K-3** (the host's interview log showed an em dash for every
+duration), **K-14** (icons needed the network), a meeting created with interview
+mode on never stamping its start time, and a word-loss path when Chrome restarts
+speech recognition without delivering a final.
+
+### Suites
+
+| Suite | Baseline | Now |
+|---|---|---|
+| Backend | 258 passed, 2 skipped | **276 passed, 2 skipped** |
+| Lint | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend | 13 passed | **71 passed** |
+| Build | succeeded | **succeeded** |
+| Profile comparison | — | **0 of 15 layouts differ**, with the font CDN blocked |
+
+Three baseline tests were intentionally rewritten because the brief changes the
+behaviour they encoded — the two-way interview toggle, the rollup's
+before-and-after setup, and the append-only attendance row. Each is named and
+explained in `FIXES.md`.
+
+### Still needing a human
+
+`FIXES.md` holds a two-device script covering every bug, step by step, with what
+to expect. Interview mode and the speech half of Bug 1 **need two devices**:
+`npm run dev:lan` serves the frontend over HTTPS on the local network with
+`/api` and `/ws` proxied through it, so the second device needs one address and
+one certificate.

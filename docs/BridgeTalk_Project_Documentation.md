@@ -4915,6 +4915,28 @@ from a run, not from memory.
 
 # 19. Known issues, limitations and future work
 
+> ### Update — 2026-10-12
+>
+> **K-1, K-2, K-3 and K-14 are fixed**, along with Bugs 1–5 reported from
+> two-participant testing. See **`FIXES.md`** for each root cause, the fix, and
+> the test that now guards it. The entries below are kept as the record of what
+> was found; their current status is:
+>
+> | ID | Status |
+> |---|---|
+> | **K-1** engine-id mismatch crashed the meeting | **Fixed.** Ids reconciled, legacy values migrated, and `resolveProvider` made incapable of throwing |
+> | **K-2** `POST /api/transcripts` discarded `segment_id` | **Still open.** The endpoint remains uncalled by any page; the WebSocket path sets the field correctly |
+> | **K-3** `focus-events` omitted `duration_away_ms` | **Fixed** |
+> | **K-4** ISL letters `H` and `J` at 0 % recall | **Still open.** A trained-model defect; needs more distinct poses |
+> | **K-14** icons needed the network on first load | **Fixed.** Roboto and Material Symbols are now self-hosted from npm, so the app runs entirely offline after setup |
+>
+> Also changed by those fixes, and **superseding what §9.5 and §7.3.4 say**:
+> `meeting_participants` is now **one row per (meeting, user)** with a UNIQUE
+> constraint, `join_meeting` upserts, and `MeetingDetail` carries a
+> `participant_count` computed with `COUNT(DISTINCT user_id)`. Interview mode is
+> **one-way** and is **broadcast** to the room. Three new WebSocket message
+> types exist: `interview-mode`, `meeting-ended` and `focus-event`.
+
 ## 19.1 Defects
 
 Severity: **Critical** = a user can break the application. **Major** = a feature

@@ -858,3 +858,129 @@ the config both ways.
 | Build | succeeded | **succeeded** |
 
 ---
+
+# Manual test script — two devices
+
+Everything below needs a camera, a voice, or two devices. **None of it has been
+verified by me**, and the automated suites cannot cover any of it.
+
+## Setup
+
+```bash
+# Terminal 1
+./scripts/run_backend.sh
+
+# Terminal 2 — LAN mode: HTTPS, and /api + /ws proxied through Vite
+cd frontend && npm run dev:lan
+```
+
+Take the **Network** address Vite prints, add it to `CORS_ORIGINS` in the
+repository-root `.env`, and restart the backend. On the second device open that
+address and accept the certificate warning (**Advanced → Proceed**).
+
+Sign in as a **different user on each device**. Add `?debug=1` to the meeting
+URL on either device for the diagnostic overlay.
+
+> For Bug 1, Bug 2 and Bug 4 two windows on one laptop is sufficient and
+> quicker. Bug 3 and the speech half of Bug 1 **need two devices** — clicking
+> the other window on one laptop is a genuine focus change, so every
+> interaction records a violation, and two windows share one microphone.
+
+## B1 — captions flow continuously
+
+| # | Do this | Expect |
+|---|---|---|
+| **B1-1** | Hearing user says *"good morning"*, pauses ~2 s, then *"shall we start"* | **One block**: one avatar, one name, and **one paragraph** reading "good morning shall we start". **Not two lines.** This is the bug |
+| **B1-2** | Keep talking for four or five sentences | The paragraph grows to **three lines**, then older lines scroll up and out. The newest words stay in the **same place** on screen |
+| **B1-3** | Watch a sentence being spoken | Text appears **word by word**, in **grey**, and turns **white** when you pause. It must never jump or reorder |
+| **B1-4** | Stop talking and wait ~5 s | The block **fades out** |
+| **B1-5** | Both people talk in turn | At most **two** blocks on screen; the older one disappears first |
+| **B1-6** | Deaf user fingerspells several letters without pausing | Each letter appears on the other screen **as it is committed**, not only at the end of the segment |
+| **B1-7** | Settings → Captions → **"Browser (Web Speech)"** | **The meeting must NOT crash.** This was K-1. Captions continue word by word |
+| **B1-8** | Stop talking for ~15 s, then speak again | Captions resume by themselves. **No words lost** across Chrome's silent restart |
+
+## B2 — each screen shows only the other person
+
+| # | Do this | Expect |
+|---|---|---|
+| **B2-1** | Hearing user speaks | Caption appears **on the deaf user's screen only**. The speaker's own caption area stays empty |
+| **B2-2** | Deaf user signs | Caption appears **on the hearing user's screen only** |
+| **B2-3** | Open the **Transcript** panel on either device | **Both** sides of the conversation, in time order. This is the record and is unaffected |
+| **B2-4** | Deaf user watches their own tile while signing | The detection **pill** still shows what is being recognised, with **undo** and **clear** |
+| **B2-5** | Download the TXT after the call | Contains **both** sides |
+
+## B3 — interview mode
+
+Needs **two devices**.
+
+| # | Do this | Expect |
+|---|---|---|
+| **B3-1** | Participant looks for the interview control | **Not present.** Host only |
+| **B3-2** | Host: More → **Turn on interview mode** | Host sees *"Interview mode is on for everyone"* |
+| **B3-3** | **Look at the participant's device** | A **blocking dialog** appears **within a second**, reading *"The host has turned on interview mode…"*, with one button: **Continue in full screen**. **This is the bug — before the fix nothing happened here at all** |
+| **B3-4** | Check the call behind the dialog | Audio and video **keep running** |
+| **B3-5** | Participant presses **Continue in full screen** | The meeting goes **fullscreen** |
+| **B3-6** | Participant tries **Ctrl+T**, **Ctrl+N**, **Ctrl+W**, **Esc** (Chrome/Edge) | **Captured by the page.** In Firefox/Safari Esc exits fullscreen — expected, and the host is told enforcement is reduced |
+| **B3-7** | Participant tries **right-click** | No context menu |
+| **B3-8** | Participant tries to **reload** | A browser confirmation appears. It can still be dismissed — `beforeunload` only asks |
+| **B3-9** | Participant looks at **Leave** | **Disabled**, tooltip *"Only the host can end this interview"* |
+| **B3-10** | Participant switches to another app, waits ~5 s, comes back | Overlay *"Return to full screen to continue"*; **host gets a toast** within a second; a red **count** appears beside the name in the host's **People** panel |
+| **B3-11** | Host: More menu again | **"Interview mode is on"**, disabled. It cannot be switched off |
+| **B3-12** | Host presses Leave | **No "just leave"** option — only **End meeting for everyone**, warning that it ends the interview |
+| **B3-13** | Host ends the meeting | Participant's keyboard lock **releases**, fullscreen **exits**, and they land on the **meeting-ended** page |
+| **B3-14** | Host opens the transcript afterwards | **"Interview mode log"** lists each event with participant, time and a **real duration** — not an em dash. That was K-3 |
+| **B3-15** | Participant **reloads** during the interview, before B3-13 | The dialog comes **straight back**. Reloading is not an escape |
+| **B3-16** | Participant presses **Present** and cancels the picker | **No violation recorded.** The app's own dialog must not count |
+
+**What it cannot do, and must not claim to:** Alt+Tab, Cmd+Tab, Cmd+Space,
+Mission Control, the Windows key, force-quitting the browser, a second monitor,
+a phone, paper notes, a second computer, screen recording, or a window placed
+beside the meeting that is never clicked. For all of these it **detects, blocks
+the view, and reports** — it does not prevent.
+
+## B4 — the participant count
+
+| # | Do this | Expect |
+|---|---|---|
+| **B4-1** | Host creates a meeting and joins; guest joins. Both leave | Home card and History row both say **"2 participants"**, with **two** avatars |
+| **B4-2** | Guest rejoins and leaves **three** times, then both leave | Still **2** — not 5 |
+| **B4-3** | Host's laptop sleeps and reconnects mid-meeting | Still **2** |
+| **B4-4** | Open the **transcript page** for that meeting | Header shows the **same** number |
+| **B4-5** | Look at the **meeting-ended** page | Shows the **same** number |
+| **B4-6** | Open the **People** panel during a meeting | Headed **"Currently in this meeting"** — a different, live number, and labelled as such |
+| **B4-7** | Create a meeting and never enter it | **"No one joined"** — creating is not attending |
+
+## B5 — the layout in a private window
+
+| # | Do this | Expect |
+|---|---|---|
+| **B5-1** | Open the app in a **fresh private/incognito window** | Icons render **immediately**; nothing is blank, and no ligature names ("mic", "videocam") ever appear as text |
+| **B5-2** | Compare side by side with your normal window at the same size | **Identical** layout |
+| **B5-3** | Turn **Wi-Fi off** and reload the private window | Still correct. Fonts are served from our own origin |
+| **B5-4** | Zoom to **80%**, then **125%** | No overlapping text, no horizontal scrollbar |
+| **B5-5** | Resize from **1024** to **1920 px** | No overlap, no bad wrapping |
+| **B5-6** | Repeat B5-1 on Home, Lobby, Meeting, History and Transcript | All five correct |
+
+Automated equivalent, which **has** been run:
+
+```bash
+cd frontend && npm run compare:profiles:offline
+```
+
+---
+
+# Summary of suite results
+
+| Suite | Baseline (`c59fcad`) | After all five fixes |
+|---|---|---|
+| Backend `pytest` | 258 passed, 2 skipped | **276 passed, 2 skipped** |
+| Frontend `npm run lint` | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend `npm test` | 13 passed | **71 passed** |
+| Frontend `npx vite build` | succeeded | **succeeded** |
+| Profile comparison | did not exist | **0 of 15 layouts differ, CDN blocked** |
+
+**Nothing that passed in the baseline fails.** Three baseline tests were
+*intentionally* rewritten because the brief changes the behaviour they encoded;
+each is named and explained in its fix section above.
+
+New tests: **+18 backend**, **+58 frontend**.

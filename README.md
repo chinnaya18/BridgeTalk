@@ -1049,7 +1049,7 @@ BridgeTalk/
 │   │   ├── config.py       pydantic-settings; the only reader of .env
 │   │   ├── database.py     engine + session factory
 │   │   └── main.py         app, CORS, routers, model load at startup
-│   ├── tests/              258 tests
+│   ├── tests/              276 tests
 │   └── requirements.txt    every version pinned
 │
 ├── ml/
@@ -1140,9 +1140,9 @@ cd frontend && npm run lint && npm test
 ```
 
 ```
-pytest backend/tests -q      258 passed, 2 skipped   (~40s)
+pytest backend/tests -q      276 passed, 2 skipped   (~50s)
 npm run lint                 0 errors, 6 warnings
-npm test                     13 passed               (~2s)
+npm test                     71 passed               (~3s)
 npx vite build               built in ~2.6s
 ```
 
@@ -1209,6 +1209,32 @@ the GPU context is lost, and the throw destroyed the entire meeting to fail at
 drawing a decorative overlay), and they caught that the lobby's device picker
 had no effect because `MeetingRoom` was still reading query parameters after the
 lobby moved to `sessionStorage`.
+
+### Profile comparison (Bug 5)
+
+```bash
+cd frontend && npm run compare:profiles           # warm vs cold profile
+cd frontend && npm run compare:profiles:offline   # and with the font CDN blocked
+```
+
+`scripts/compare-profiles.mjs` drives Chromium through Playwright, captures
+every page from a warm profile and from a brand-new context (which is what an
+incognito window is), and reports a pixel diff **and** a layout fingerprint —
+element boxes, every icon box, whether each webfont loaded, and whether the
+document overflows. The layout fingerprint is the gate: "text and icons are
+misaligned" is a layout statement, and a pixel diff on a page with a live camera
+feed is meaningless because the frame changes between shots.
+
+Current result, with the CDN blocked: **0 of 15 layouts differ**, across five
+pages at 1024/1280/1920 px plus a zoom sweep at 80/100/125%.
+
+### Fonts are self-hosted
+
+Roboto and Material Symbols Outlined come from the `@fontsource/roboto` and
+`material-symbols` npm packages and are served from our own origin. They used to
+load from Google's CDN, and that was Bug 5: measured, the icon font was still
+loading **2.5 seconds** after page load on a good connection, and never arrived
+on a restricted one. **The application now runs entirely offline after setup.**
 
 ### Manual end-to-end checklist
 

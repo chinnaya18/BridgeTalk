@@ -239,3 +239,91 @@ describe('buildCaptionBlocks — robustness', () => {
     expect(blocks[0].source).toBe('speech');
   });
 });
+
+describe('buildCaptionBlocks — Bug 2: your own captions are not shown to you', () => {
+  const ME = 1;
+  const THEM = 2;
+
+  it('drops captions produced by the excluded speaker', () => {
+    const blocks = buildCaptionBlocks(
+      [
+        seg({ id: 'mine', speaker: ME, name: 'Me', source: 'sign', text: 'I am signing', at: 0 }),
+        seg({ id: 'theirs', speaker: THEM, name: 'Them', source: 'speech', text: 'I am speaking', at: 200 }),
+      ],
+      { now: T0 + 300, excludeSpeakerId: ME },
+    );
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].speakerName).toBe('Them');
+    expect(blocks[0].settledText).toBe('I am speaking');
+  });
+
+  /**
+   * The two screens in the reported scenario. One rule produces both.
+   */
+  it("the hearing user sees only the deaf user's sign captions", () => {
+    const stream = [
+      seg({ id: 'sign1', speaker: THEM, name: 'Deaf user', source: 'sign', text: 'good morning', at: 0 }),
+      seg({ id: 'speech1', speaker: ME, name: 'Hearing user', source: 'speech', text: 'good morning to you', at: 500 }),
+    ];
+    const blocks = buildCaptionBlocks(stream, { now: T0 + 600, excludeSpeakerId: ME });
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].source).toBe('sign');
+    expect(blocks[0].settledText).toBe('good morning');
+  });
+
+  it("the deaf user sees only the hearing user's speech captions", () => {
+    const stream = [
+      seg({ id: 'sign1', speaker: ME, name: 'Deaf user', source: 'sign', text: 'good morning', at: 0 }),
+      seg({ id: 'speech1', speaker: THEM, name: 'Hearing user', source: 'speech', text: 'good morning to you', at: 500 }),
+    ];
+    const blocks = buildCaptionBlocks(stream, { now: T0 + 600, excludeSpeakerId: ME });
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].source).toBe('speech');
+    expect(blocks[0].settledText).toBe('good morning to you');
+  });
+
+  it('works when a participant uses the other mode — it filters by SPEAKER, not source', () => {
+    // A hearing user who also signs. Their sign captions are still their own,
+    // so they are still hidden from them.
+    const blocks = buildCaptionBlocks(
+      [
+        seg({ id: 'a', speaker: ME, source: 'sign', name: 'Me', text: 'my sign', at: 0 }),
+        seg({ id: 'b', speaker: ME, source: 'speech', name: 'Me', text: 'my speech', at: 200 }),
+        seg({ id: 'c', speaker: THEM, source: 'sign', name: 'Them', text: 'their sign', at: 400 }),
+      ],
+      { now: T0 + 500, excludeSpeakerId: ME },
+    );
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].speakerName).toBe('Them');
+  });
+
+  it('shows everything when no speaker is excluded', () => {
+    const stream = [
+      seg({ id: 'a', speaker: ME, name: 'Me', text: 'mine', at: 0 }),
+      seg({ id: 'b', speaker: THEM, name: 'Them', text: 'theirs', at: 200 }),
+    ];
+    expect(buildCaptionBlocks(stream, { now: T0 + 300 })).toHaveLength(2);
+    expect(buildCaptionBlocks(stream, { now: T0 + 300, excludeSpeakerId: null })).toHaveLength(2);
+  });
+
+  it('removing your own segment does not merge the two speakers around it', () => {
+    // A, me, A. With me removed the two A blocks are adjacent in time and
+    // must merge into one paragraph — not stay split by a gap that is no
+    // longer there.
+    const blocks = buildCaptionBlocks(
+      [
+        seg({ id: 'a1', speaker: THEM, name: 'Them', text: 'first', at: 0 }),
+        seg({ id: 'mine', speaker: ME, name: 'Me', text: 'interjection', at: 300 }),
+        seg({ id: 'a2', speaker: THEM, name: 'Them', text: 'second', at: 600 }),
+      ],
+      { now: T0 + 700, excludeSpeakerId: ME },
+    );
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].settledText).toBe('first second');
+  });
+});

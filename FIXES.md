@@ -325,3 +325,75 @@ Bug 1's visual result cannot be verified from a terminal. See the two-device
 script at the end of this file: steps **B1-1** to **B1-6**.
 
 ---
+
+## Fix 3 — Bug 2: each user must see only the other person's captions
+
+### Root cause
+
+Not a defect so much as an unimplemented rule. The server broadcasts every
+caption to **everyone including the sender** — deliberately, because that is
+what makes both screens render from one source of truth rather than each side
+assembling its own words from local state. `CaptionRail` then rendered
+everything it was given, so each participant saw their own captions echoed back.
+
+### Fix
+
+One rule, applied in the display layer only: **the caption area shows captions
+produced by other participants, never your own.**
+
+| File | Change |
+|---|---|
+`utils/captionBlocks.js` | `excludeSpeakerId` option; a caption whose `speakerId` matches is filtered out before grouping |
+`pages/MeetingRoom.jsx` | Passes `excludeSpeakerId={user?.id ?? null}` to `CaptionRail` |
+
+Filtering happens **before** grouping, which matters: with your own interjection
+removed, the two surrounding segments from the other speaker become adjacent and
+**merge into one paragraph** rather than staying split by a gap that is no longer
+there. There is a test for exactly that.
+
+**What this covers.** On the hearing user's screen the only captions left are
+the deaf user's sign captions; on the deaf user's screen, the hearing user's
+speech captions. One rule produces both, and it still holds if a participant
+uses the other mode — it filters by **speaker**, not by source.
+
+**What is deliberately unchanged:**
+
+- The server still broadcasts every caption to everyone.
+- The **live transcript panel** still shows both sides — it reads the persisted
+  rows, not this list.
+- The **saved transcript** and both downloads still contain both sides.
+- The signer still sees their own recognition live on their own tile's detection
+  pill, with undo and clear.
+
+### Tests
+
+`src/test/captionBlocks.test.js` — **6 added** (22 total in the file): the
+excluded speaker is dropped; the hearing user's screen shows only sign; the deaf
+user's screen shows only speech; filtering is by speaker not source (a hearing
+user who also signs still has their own signs hidden); nothing is filtered when
+no speaker is excluded; **and removing your own segment merges the two speakers
+around it**.
+
+`src/test/pages.test.jsx` — **2 added**, both end-to-end through the real path:
+a caption event is pushed into the fake WebSocket, parsed by `useSignSocket`,
+applied by `useCaptionStore` and rendered by `CaptionRail`, with nothing stubbed
+between the wire and the DOM.
+
+1. the other participant's caption appears; your own does **not**
+2. consecutive captions from one speaker render as **one** `<article>`
+
+The second test initially failed for a reason worth recording: my helper derived
+each `segment_id` from the text length, and two different phrases were both ten
+characters, so they collided and the store **correctly replaced** one with the
+other. The protocol was right and the test was wrong.
+
+### Suites after this fix
+
+| Suite | Baseline | Now |
+|---|---|---|
+| Backend | 258 passed, 2 skipped | **258 passed, 2 skipped** |
+| Lint | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend tests | 13 passed | **59 passed** (+46) |
+| Build | succeeded | **succeeded** |
+
+---

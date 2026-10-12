@@ -903,10 +903,22 @@ export default function MeetingRoom() {
             }
           />
 
+          {/* The caption area shows what OTHER people produced, never your
+              own words (Bug 2). On the hearing user's screen that leaves the
+              deaf user's sign captions; on the deaf user's screen it leaves
+              the hearing user's speech captions — one rule covering both, and
+              it still holds if a participant uses the other mode.
+
+              Your own words are not lost: the signer sees them live on their
+              own tile's detection pill, and BOTH sides of the conversation
+              remain in the live transcript panel and in the saved transcript,
+              which are the record. The server still broadcasts every caption
+              to everyone, so nothing about persistence changes. */}
           <CaptionRail
             captions={captions}
             size={preferences.captionSize}
             visible={captionsVisible}
+            excludeSpeakerId={user?.id ?? null}
           />
         </div>
 

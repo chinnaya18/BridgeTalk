@@ -1,4 +1,4 @@
-import { screen, waitFor } from '@testing-library/react';
+import { act, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import History from '../pages/History';
@@ -159,5 +159,88 @@ describe('the meeting room honours the lobby', () => {
     renderPage(<MeetingRoom />, { path: '/meeting/:code', entry: '/meeting/K7Q-2M4' });
     expect(await screen.findByRole('button', { name: /Hide captions/i })).toBeTruthy();
     expect(await screen.findByLabelText('Live captions')).toBeTruthy();
+  });
+});
+
+describe('Bug 2 — the caption area shows only other people', () => {
+  beforeEach(() => {
+    installApiStub();
+  });
+
+  /**
+   * Pushes a caption event through the REAL socket path: the fake WebSocket
+   * delivers it, useSignSocket parses it, useCaptionStore applies it, and
+   * CaptionRail renders it. Nothing is stubbed between the wire and the DOM.
+   */
+  // A distinct segment id per call. Deriving it from the text (its length, say)
+  // is a trap: two different phrases of the same length would collide and the
+  // store would correctly REPLACE one with the other, which looks like a
+  // grouping bug but is the protocol working.
+  let segmentCounter = 0;
+
+  async function deliverCaption({ speakerId, speakerName, source, text, segmentId }) {
+    // Read the class off globalThis rather than importing setup.js: that is the
+    // exact class the app constructed, with no chance of a second module
+    // instance owning a different `instances` array.
+    const sockets = globalThis.WebSocket.instances ?? [];
+    const socket = await waitFor(() => {
+      const found = sockets.find((s) => s.url.includes('/ws/predict'));
+      expect(found, 'no /ws/predict socket was opened').toBeTruthy();
+      return found;
+    });
+
+    await act(async () => {
+      socket.emit({
+        type: 'caption',
+        meeting_code: 'K7Q-2M4',
+        segment_id: segmentId ?? `seg-${speakerId}-${(segmentCounter += 1)}`,
+        speaker: { id: speakerId, name: speakerName },
+        source,
+        text,
+        is_final: true,
+        confidence: null,
+        timestamp: new Date().toISOString(),
+      });
+    });
+  }
+
+  it("shows the other participant's caption but not your own", async () => {
+    // installApiStub signs us in as user id 1.
+    renderPage(<MeetingRoom />, { path: '/meeting/:code', entry: '/meeting/K7Q-2M4' });
+    await screen.findByRole('button', { name: /Leave call/i });
+
+    await deliverCaption({
+      speakerId: 2,
+      speakerName: 'Thamizhthilaga S D S',
+      source: 'sign',
+      text: 'good morning from the other side',
+    });
+    expect(await screen.findByText(/good morning from the other side/)).toBeTruthy();
+
+    await deliverCaption({
+      speakerId: 1,
+      speakerName: 'Swarna Rathna A',
+      source: 'speech',
+      text: 'these are my own words',
+    });
+
+    // The caption area must not echo your own words back at you.
+    const area = screen.getByLabelText('Live captions');
+    expect(area.textContent).toContain('good morning from the other side');
+    expect(area.textContent).not.toContain('these are my own words');
+  });
+
+  it('merges consecutive captions from one speaker into a single block', async () => {
+    renderPage(<MeetingRoom />, { path: '/meeting/:code', entry: '/meeting/K7Q-2M4' });
+    await screen.findByRole('button', { name: /Leave call/i });
+
+    await deliverCaption({ speakerId: 2, speakerName: 'Thamizh', source: 'speech', text: 'first part' });
+    await deliverCaption({ speakerId: 2, speakerName: 'Thamizh', source: 'speech', text: 'second bit' });
+
+    const area = screen.getByLabelText('Live captions');
+    // One block: the speaker's name appears once, and both texts are present.
+    expect(area.textContent).toContain('first part');
+    expect(area.textContent).toContain('second bit');
+    expect(area.querySelectorAll('article')).toHaveLength(1);
   });
 });

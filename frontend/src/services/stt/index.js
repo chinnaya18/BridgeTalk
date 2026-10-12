@@ -88,25 +88,57 @@ export function resolveAuto() {
   return { id: null, fellBack: false, reason: 'No speech engine works in this browser.' };
 }
 
-export function resolveProvider(preferred = 'auto') {
-  if (preferred === 'auto') return resolveAuto();
+/**
+ * Legacy preference values, mapped to the id the registry actually uses.
+ *
+ * The Settings dialog shipped offering `'browser'` while PROVIDERS has always
+ * been keyed `'webspeech'`. That value is persisted in localStorage, so it
+ * outlives the fix and has to keep resolving rather than being rejected.
+ */
+const LEGACY_IDS = { browser: 'webspeech', web_speech: 'webspeech' };
 
-  if (isProviderSupported(preferred)) {
-    return { id: preferred, fellBack: false, reason: null };
+/** Map a stored or requested engine id onto a canonical one. */
+export function canonicalEngineId(id) {
+  if (!id) return 'auto';
+  return LEGACY_IDS[id] ?? id;
+}
+
+export function resolveProvider(preferred = 'auto') {
+  // Accept a legacy id rather than falling through to the unknown-id path.
+  const requested = canonicalEngineId(preferred);
+
+  if (requested === 'auto') return resolveAuto();
+
+  if (isProviderSupported(requested)) {
+    return { id: requested, fellBack: false, reason: null };
   }
 
   const fallback = Object.keys(PROVIDERS).find(
-    (id) => id !== preferred && isProviderSupported(id),
+    (id) => id !== requested && isProviderSupported(id),
   );
 
   if (fallback) {
+    // `PROVIDERS[requested]` is read through optional chaining DELIBERATELY.
+    //
+    // This line used to be `PROVIDERS[preferred].label`, and that was bug K-1.
+    // The Settings dialog stored `'browser'`, which is not a registry key, so
+    // this dereferenced `undefined` and threw
+    // "Cannot read properties of undefined (reading 'label')".
+    // resolveProvider is called in the BODY of useSpeechCaptions, so it threw
+    // during render and took the meeting room to the error boundary — and
+    // because the preference is persisted, reloading did not recover.
+    //
+    // The id mapping above fixes the specific case. This stays defensive
+    // because an unknown engine id must degrade to a working engine, never
+    // crash the meeting.
+    const label = PROVIDERS[requested]?.label ?? requested;
     return {
       id: fallback,
       fellBack: true,
       reason:
-        preferred === 'webspeech'
+        requested === 'webspeech'
           ? 'This browser has no Web Speech API, so Whisper is being used instead.'
-          : `The ${PROVIDERS[preferred].label} provider is unavailable here.`,
+          : `The ${label} provider is unavailable here.`,
     };
   }
 

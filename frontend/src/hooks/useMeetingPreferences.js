@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
+import { canonicalEngineId } from '../services/stt';
+
 /**
  * Settings the user changes in the meeting, remembered per user.
  *
@@ -33,7 +35,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 export const DEFAULT_PREFERENCES = {
   captionSize: 'normal', // normal | large | xlarge
-  speechEngine: 'auto', // auto | browser | whisper
+  speechEngine: 'auto', // auto | webspeech | whisper
   // en-IN, not en-US: the demo is in India and the Indian English acoustic
   // model recognises local accents markedly better.
   speechLanguage: 'en-IN',
@@ -43,7 +45,7 @@ export const DEFAULT_PREFERENCES = {
 
 const VALID = {
   captionSize: ['normal', 'large', 'xlarge'],
-  speechEngine: ['auto', 'browser', 'whisper'],
+  speechEngine: ['auto', 'webspeech', 'whisper'],
   recognitionMode: ['dynamic', 'isl', 'static'],
 };
 
@@ -64,8 +66,14 @@ function sanitise(raw) {
 
   const clean = { ...DEFAULT_PREFERENCES };
   Object.keys(DEFAULT_PREFERENCES).forEach((name) => {
-    const value = raw[name];
+    let value = raw[name];
     if (value === undefined) return;
+
+    // Migrate a stored engine id from before the K-1 fix. Without this, a user
+    // who had selected "Browser" keeps the old 'browser' value in
+    // localStorage, it fails validation, and they are silently moved to
+    // 'auto' — which works, but loses a choice they deliberately made.
+    if (name === 'speechEngine') value = canonicalEngineId(value);
 
     if (VALID[name]) {
       if (VALID[name].includes(value)) clean[name] = value;

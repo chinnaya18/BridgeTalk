@@ -1,6 +1,7 @@
 import { useState } from 'react';
 
 import Dialog from '../ui/Dialog';
+import { CAPTION_SIZES, ENGINES, LANGUAGES } from './engines';
 import Icon from '../ui/Icon';
 import Select from '../ui/Select';
 
@@ -29,26 +30,6 @@ const TABS = [
   { id: 'av', label: 'Audio and video', icon: 'tune' },
   { id: 'captions', label: 'Captions', icon: 'closed_caption' },
   { id: 'sign', label: 'Sign recognition', icon: 'sign_language' },
-];
-
-const CAPTION_SIZES = [
-  { value: 'normal', label: 'Normal' },
-  { value: 'large', label: 'Large' },
-  { value: 'xlarge', label: 'Extra large' },
-];
-
-const ENGINES = [
-  { value: 'auto', label: 'Auto (recommended)' },
-  { value: 'browser', label: 'Browser (Web Speech)' },
-  { value: 'whisper', label: 'Whisper (on the server)' },
-];
-
-const LANGUAGES = [
-  { value: 'en-IN', label: 'English (India)' },
-  { value: 'en-US', label: 'English (United States)' },
-  { value: 'en-GB', label: 'English (United Kingdom)' },
-  { value: 'hi-IN', label: 'Hindi (India)' },
-  { value: 'ta-IN', label: 'Tamil (India)' },
 ];
 
 export default function SettingsDialog({
@@ -170,7 +151,7 @@ export default function SettingsDialog({
               hint={
                 preferences.speechEngine === 'auto'
                   ? 'Uses your browser when it supports speech recognition, and the server otherwise.'
-                  : preferences.speechEngine === 'browser'
+                  : preferences.speechEngine === 'webspeech'
                     ? 'Word-by-word captions as you speak. Needs Chrome or Edge.'
                     : 'Runs on the server. More accurate, but only produces text when you pause.'
               }

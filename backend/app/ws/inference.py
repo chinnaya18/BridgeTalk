@@ -129,6 +129,39 @@ def _error(code: str, message: str) -> dict[str, Any]:
     return {"type": "error", "code": code, "message": message}
 
 
+def _room_state(meeting_code: str) -> dict[str, Any] | None:
+    """The meeting's current room-level state, for the `connected` handshake.
+
+    Read fresh from the database on every connection rather than cached,
+    because the whole point is to be correct for a client that was
+    disconnected while something changed.
+
+    Returns None for a code with no meeting row — notably the `DEMO` code used
+    by the standalone /detect page, which is not a real meeting.
+    """
+    try:
+        with SessionLocal() as session:
+            meeting = session.scalar(select(Meeting).where(Meeting.code == meeting_code))
+            if meeting is None:
+                return None
+            return {
+                "is_interview_mode": bool(meeting.is_interview_mode),
+                "interview_mode_started_at": (
+                    meeting.interview_mode_started_at.isoformat()
+                    if meeting.interview_mode_started_at
+                    else None
+                ),
+                "host": {"id": meeting.host_id},
+                "ended_at": meeting.ended_at.isoformat() if meeting.ended_at else None,
+            }
+    except Exception:  # noqa: BLE001
+        # A failure here must not stop the socket connecting. Sign recognition
+        # does not depend on room state, and a client that gets no `meeting`
+        # block simply keeps whatever it already had.
+        logger.exception("Could not read room state for %s", meeting_code)
+        return None
+
+
 def _handle_static_frame(
     hands: list[dict[str, Any]],
     smoother: PredictionSmoother,
@@ -416,6 +449,12 @@ async def predict_socket(
             "type": "connected",
             "meeting_code": normalized_code,
             "user": {"id": user.id, "name": user.name},
+            # Room state, so a client that JOINS or RECONNECTS learns it from
+            # the handshake rather than only from a live broadcast it may have
+            # missed while its socket was down. This is the other half of the
+            # Bug 3 fix: the broadcast covers everyone currently connected,
+            # this covers everyone who connects next.
+            "meeting": _room_state(normalized_code),
             "model": predictor.describe(),
             # Advertised so the UI can enable or hide each mode rather than
             # offering one that cannot work on this deployment.

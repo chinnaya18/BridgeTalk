@@ -397,3 +397,173 @@ other. The protocol was right and the test was wrong.
 | Build | succeeded | **succeeded** |
 
 ---
+
+## Fix 4 — Bug 3: interview mode did not work
+
+### Diagnosis — each cause the brief named, checked
+
+| # | Checked | Finding |
+|---|---|---|
+| 1 | Is the toggle shown to, or accepted from, non-hosts? | **No, correctly.** `ControlBar.jsx:150` wraps the menu item in `{isHost ? … : null}`, and `set_interview_mode` returns **403** to a non-host (`meetings.py:339`). Not a cause |
+| 2 | Does the state change reach the other participant? | **NO. This is the central cause.** See below |
+| 3 | Does someone who joins or reconnects after it was switched on receive it? | **Joining: yes** — `POST /join` returns the meeting record with `is_interview_mode: true`. **Reconnecting: no** — the meeting record is fetched once on mount and never re-read |
+| 4 | Is fullscreen requested without a user click? | **No, correctly.** `enterEnforcement` runs from the dialog's acknowledge click, and the comment at `useInterviewMode.js:99` records that this is why. Not a cause |
+| 5 | Is `navigator.keyboard.lock()` called outside fullscreen? | **No, correctly.** It is called after `await requestFullscreen()` resolves, so it is inside fullscreen. Not a cause |
+| 6 | Do the listeners live in a component that unmounts? | **No.** `useInterviewMode` is called from `MeetingRoom`, which stays mounted for the whole meeting. Not a cause |
+
+### The central cause
+
+`MeetingRoom.jsx` fetches the meeting record **once**, on mount
+(lines 159 and 167). `toggleInterviewMode` calls the PATCH endpoint and then
+`setMeeting(updated)` — **updating only the host's own copy of the state**.
+
+There was no broadcast, no polling, and no re-fetch. So:
+
+- the host toggles it → **the host's** UI updates;
+- the other participant's `meeting.is_interview_mode` stays `false`;
+- `interviewOn` stays `false` on their client, so no dialog, no fullscreen, no
+  keyboard lock and no detection.
+
+**Interview mode worked only for the host — the one person it does not apply
+to.** Everything downstream of `interviewOn` was correct and simply never ran.
+
+A second, quieter cause: the record is never re-read, so a participant whose
+socket drops and reconnects also never learns the state changed while they were
+away.
+
+### Requirements that were not implemented at all
+
+Beyond the propagation bug, the brief specifies behaviour that did not exist:
+
+| Requirement | Before |
+|---|---|
+| 3 — stays on until the meeting ends; cannot be switched off | `toggleInterviewMode` toggled **both ways**, and the server accepted `enabled: false` |
+| 4 — the exact blocking dialog wording, with one button | Different wording, and the dialog was not driven by a live state change |
+| 5 — block the right-click menu; warn on `beforeunload` | Neither |
+| 6 — the participant's Leave button disabled | Not disabled |
+| 7 — alert the host in real time with a toast, and a violation count beside the name in the People panel | The host polled every 5 s; no toast, no count in the panel |
+| 8 — on the host ending, the server broadcasts the end and the participant's client releases the lock, exits fullscreen and goes to the ended page | No end broadcast |
+
+---
+
+### Fix
+
+**The propagation fix — two halves, because one alone is not enough.**
+
+| Half | Covers | Where |
+|---|---|---|
+| **Live broadcast** | Everyone *currently* connected | `set_interview_mode` is now `async` and calls `_announce_to_room`, pushing `{type: "interview-mode", …}` to every socket in the room |
+| **Handshake state** | Everyone who connects *next* — a join, a reload, or a reconnect | `/ws/predict`'s `connected` message now carries a `meeting` block with the live interview state, read fresh from the database on every connection |
+
+`_announce_to_room` notifies **both** connection managers, because a participant
+may have one socket open and not the other: the inference socket is the
+meeting's text channel and is always connected, while the signalling socket can
+be absent if the call never established. A broadcast failure is logged and
+**never fails the request** — the database is the source of truth and any client
+that reconnects reads it from the handshake.
+
+**The other requirements:**
+
+| # | Requirement | Implementation |
+|---|---|---|
+| 1 | Host only; server rejects others with 403 | Already correct. Covered by `test_a_participant_cannot_switch_interview_mode` |
+| 2 | Saved on the meeting and broadcast immediately | `_announce_to_room`, above |
+| 3 | **Cannot be switched off** | Server returns **409** for `enabled: false`. The menu item is disabled once on and reads "Interview mode is on". The host's "Just leave the meeting" option is **hidden** during an interview — a host leaving without ending it would strand the candidate in fullscreen with no way out |
+| 4 | The exact dialog wording, one button | `InterviewModeDialog` leads with the specified sentence; the button is **"Continue in full screen"**. The call keeps running behind it — the dialog is an overlay, and the camera and microphone are already live |
+| 5 | Fullscreen then keyboard lock on that click; block right-click; `beforeunload` | Fullscreen and lock were already correct and in the right order. Right-click was already blocked. **`beforeunload` added** |
+| 6 | Participant's Leave disabled with a tooltip | `canLeave={!interviewOn \|\| isHost}`; disabled with the tooltip *"Only the host can end this interview"* |
+| 7 | Alert the host in real time; count beside the name in People | `log_focus_event` is now `async` and uses a **new `send_to_user`** on the connection manager to notify **only the host's** sockets. The host's client raises a toast and keeps a per-participant tally, shown as a red badge beside the name in the People panel |
+| 8 | On ending, the server broadcasts; the client releases the lock, exits fullscreen, leaves | `end_meeting` is now `async` and broadcasts `{type: "meeting-ended", …}`. `useInterviewMode` exposes **`releaseEnforcement`**; `MeetingRoom` awaits it, hangs up, and navigates to `/ended/{code}` |
+| 9 | Reduced support still shows, detects and reports | Already correct — `capabilities` and `reducedEnforcement` |
+| 10 | No false violations from the app's own dialogs | Already correct — `suppressBriefly(4000)` around the screen picker |
+
+**Why the violation alert is pushed, not polled.** The host acts on it by
+talking to the candidate, so a five-second poll is five seconds of a
+conversation already going wrong. And it is **targeted, not broadcast**: a
+violation is a record *about* a participant, so sending it to the room would
+show one candidate another's lapses — exactly why `GET /focus-events` is
+host-only.
+
+### Two further defects found and fixed while here
+
+**A meeting created with interview mode on never stamped its start time.**
+`create_meeting` set `is_interview_mode` but left `interview_mode_started_at`
+NULL. The violation rollup filters on that timestamp, so such a meeting filtered
+**nothing** and every focus event ever recorded counted as a violation. Found by
+a pre-existing test whose premise depended on the broken state.
+`create_meeting` now stamps it, and `set_interview_mode` backfills a missing one.
+
+**Issue K-3, from the documentation's known-issues list.**
+`get_focus_events` built each `FocusEventPublic` **without** `duration_away_ms`,
+so it defaulted to `None` and the host's interview log showed an em dash for
+every duration — although the database held the value and the `by_participant`
+rollup read it correctly from the same rows. Now passed through.
+
+### Two baseline tests intentionally changed
+
+Both encoded behaviour the brief explicitly changes. Recorded here because
+"nothing that passed may fail" otherwise hides it:
+
+| Test | Why it changed |
+|---|---|
+| `test_host_can_switch_interview_mode_on_and_off` | Asserted two-way toggling. **Split** into `test_host_can_switch_interview_mode_on` and `test_interview_mode_cannot_be_switched_off` (409) |
+| `test_rollup_ignores_events_from_before_the_mode_was_switched_on` | Its setup relied on `interview_mode_started_at` being NULL while the flag was on — which was itself the bug above. Rewritten to move the start time directly in the database, because the API can no longer produce that state (and correctly so: `log_focus_event` 409s when the mode is off, and the mode never re-stamps its start) |
+
+### Tests
+
+| File | Added | Covers |
+|---|---|---|
+`backend/tests/test_websockets.py` | **5** | **The host switching it on reaches the other participant** (the regression test); ending reaches them; the handshake carries the state on join/reconnect; the handshake reports it off when off; `DEMO` has no room state |
+`backend/tests/test_focus_events.py` | **5** | Switching on stamps the start time; **cannot be switched off (409)**; switching on twice keeps the original start time; a meeting created with the mode on stamps its start; **every event carries its duration** (K-3) |
+`frontend/src/test/pages.test.jsx` | **4** | **The dialog appears when the broadcast arrives**; it appears from the handshake so reloading is not an escape; the participant's Leave is disabled; the host can still leave and is not shown the dialog |
+
+**Verified to bite.** Removing the broadcast makes
+`test_switching_interview_mode_on_reaches_the_other_participant` fail with
+*"no 'interview-mode' broadcast arrived — the ping sentinel came back first"*.
+
+That sentinel is itself a fix: the first version of the test **hung** instead of
+failing, because `receive_json()` blocks on a message that never comes. A
+`ping`/`pong` sentinel after the action gives a deterministic end marker, since
+a WebSocket delivers in order.
+
+### What interview mode can and cannot prevent — stated precisely
+
+| | Chrome / Edge | Firefox | Safari |
+|---|---|---|---|
+| Detect tab switch (`visibilitychange`) | Yes | Yes | Yes |
+| Detect switching application (`blur`) | Yes | Yes | Yes |
+| Detect leaving fullscreen (`fullscreenchange`) | Yes | Yes | Yes |
+| Record the event with its duration | Yes | Yes | Yes |
+| Blocking overlay until they return | Yes | Yes | Yes |
+| Fullscreen enforcement | Yes | Yes | Yes |
+| **Capture Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+Tab / Esc** | **Yes** (Keyboard Lock) | **No** | **No** |
+| Block the right-click menu | Yes | Yes | Yes |
+| Warn on close or reload (`beforeunload`) | Yes — a confirmation the user may still dismiss | Yes | Yes |
+| Host told enforcement is reduced | Yes (reports false) | Yes (reports **true**) | Yes (reports **true**) |
+
+**No browser, and no website, can:**
+
+- block **operating-system** shortcuts — **Alt+Tab, Cmd+Tab, Cmd+Space,
+  Mission Control, the Windows key**;
+- stop someone **force-quitting** the browser or putting the machine to sleep;
+- prevent a **close or reload** — `beforeunload` only asks, and the user may
+  proceed;
+- see a **second monitor**, a **phone**, **paper notes**, a **second computer**,
+  **screen recording**, or **another person in the room**;
+- detect a window placed **beside** the meeting that is never clicked, because
+  `blur` fires only on a focus change.
+
+**For all of those, interview mode detects, blocks the meeting view, and
+reports. It does not prevent.** That is what the dialog says and what the code
+comments say.
+
+### Suites after this fix
+
+| Suite | Baseline | Now |
+|---|---|---|
+| Backend | 258 passed, 2 skipped | **267 passed, 2 skipped** (+10 new, 1 split into 2) |
+| Lint | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend tests | 13 passed | **63 passed** (+50) |
+| Build | succeeded | **succeeded** |
+
+---

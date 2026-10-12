@@ -9,7 +9,7 @@
  *      is the only screen where the participant learns what is recorded.
  *   2. Fullscreen requires a user gesture. The browser will refuse
  *      `requestFullscreen()` called from a timer or an effect. The
- *      "I understand" click IS that gesture — which is why enforcement starts
+ *      "Continue in full screen" click IS that gesture — which is why enforcement starts
  *      here rather than automatically when the mode is switched on.
  *
  * WHAT IT PROMISES
@@ -41,7 +41,16 @@ export default function InterviewModeDialog({ hostName, capabilities, onAcknowle
         </p>
 
         <div id="interview-dialog-body" className="mt-4 space-y-3 text-sm text-dark-text">
-          <p>While interview mode is on:</p>
+          {/* The wording the brief specifies, stated once and plainly, before
+              the detail below. */}
+          <p className="text-base">
+            The host has turned on interview mode. The meeting will open in full
+            screen. You will not be able to switch tabs or windows until the
+            host ends the meeting. Leaving the meeting screen is recorded and
+            reported to the host.
+          </p>
+
+          <p>In detail:</p>
           <ul className="list-disc space-y-1.5 pl-5">
             <li>This meeting will go <strong>fullscreen</strong>.</li>
             <li>
@@ -54,6 +63,14 @@ export default function InterviewModeDialog({ hostName, capabilities, onAcknowle
               <strong>recorded</strong> with how long you were away.
             </li>
             <li>The meeting view is covered until you come back.</li>
+            <li>
+              Only the host can end this interview — your Leave button is{' '}
+              <strong>disabled</strong> until they do.
+            </li>
+            <li>
+              The call keeps running behind this message; your camera and
+              microphone are already live.
+            </li>
           </ul>
 
           {/* Say plainly what this cannot do. Overstating it is the fastest
@@ -90,7 +107,7 @@ export default function InterviewModeDialog({ hostName, capabilities, onAcknowle
           autoFocus
           className="btn-primary mt-5 w-full"
         >
-          I understand
+          Continue in full screen
         </button>
       </div>
     </div>

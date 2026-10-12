@@ -21,7 +21,14 @@ const INITIAL_RETRY_MS = 500;
 const MAX_RETRY_MS = 10_000;
 const MAX_ATTEMPTS = 12;
 
-export function useSignSocket({ meetingCode, enabled = true, onCaption } = {}) {
+export function useSignSocket({
+  meetingCode,
+  enabled = true,
+  onCaption,
+  onRoomState,
+  onMeetingEnded,
+  onFocusEvent,
+} = {}) {
   const socketRef = useRef(null);
   const retryTimerRef = useRef(null);
   const attemptRef = useRef(0);
@@ -47,6 +54,25 @@ export function useSignSocket({ meetingCode, enabled = true, onCaption } = {}) {
   useEffect(() => {
     onCaptionRef.current = onCaption;
   }, [onCaption]);
+
+  // Room-level state changes: Interview Mode being switched on, and the
+  // meeting being ended. Held in refs for the same reason as onCaption — a
+  // changing callback identity must not tear down and rebuild the socket.
+  const onRoomStateRef = useRef(onRoomState);
+  useEffect(() => {
+    onRoomStateRef.current = onRoomState;
+  }, [onRoomState]);
+
+  const onMeetingEndedRef = useRef(onMeetingEnded);
+  useEffect(() => {
+    onMeetingEndedRef.current = onMeetingEnded;
+  }, [onMeetingEnded]);
+
+  // Interview Mode violations, sent by the server to the HOST only.
+  const onFocusEventRef = useRef(onFocusEvent);
+  useEffect(() => {
+    onFocusEventRef.current = onFocusEvent;
+  }, [onFocusEvent]);
 
   const connect = useCallback(() => {
     if (!meetingCode) return;
@@ -84,6 +110,35 @@ export function useSignSocket({ meetingCode, enabled = true, onCaption } = {}) {
           setModelInfo(message.model ?? null);
           setDynamicModelInfo(message.dynamic_model ?? null);
           setIslModelInfo(message.isl_model ?? null);
+          // Room state from the handshake. This is what makes reloading or
+          // reconnecting NOT a way to escape Interview Mode: the server
+          // reports the current state on every connection, so a client that
+          // missed the live broadcast still learns it.
+          if (message.meeting) onRoomStateRef.current?.(message.meeting);
+          break;
+
+        case 'interview-mode':
+          // Live announcement, broadcast by the server when the host switches
+          // it on. Before this existed the state reached only the host, which
+          // is why Interview Mode did not work at all for the participant.
+          onRoomStateRef.current?.({
+            is_interview_mode: message.is_interview_mode,
+            interview_mode_started_at: message.interview_mode_started_at ?? null,
+            host: message.host ?? null,
+          });
+          break;
+
+        case 'focus-event':
+          // Only the host receives these — the server targets their socket
+          // rather than broadcasting, because a violation is a record about a
+          // participant and the room must not see each other's.
+          onFocusEventRef.current?.(message.event);
+          break;
+
+        case 'meeting-ended':
+          // The only normal way out of Interview Mode. The handler releases
+          // the keyboard lock, leaves fullscreen and navigates away.
+          onMeetingEndedRef.current?.(message);
           break;
 
         case 'prediction':

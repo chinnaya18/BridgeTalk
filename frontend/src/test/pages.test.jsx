@@ -9,7 +9,7 @@ import MeetingEnded from '../pages/MeetingEnded';
 import MeetingRoom from '../pages/MeetingRoom';
 import SignDetection from '../pages/SignDetection';
 import Transcript from '../pages/Transcript';
-import { installApiStub, renderPage } from './renderPage';
+import { MEETING, installApiStub, renderPage } from './renderPage';
 
 /**
  * Every page renders without throwing.
@@ -242,5 +242,117 @@ describe('Bug 2 — the caption area shows only other people', () => {
     expect(area.textContent).toContain('first part');
     expect(area.textContent).toContain('second bit');
     expect(area.querySelectorAll('article')).toHaveLength(1);
+  });
+});
+
+describe('Bug 3 — interview mode reaches the participant', () => {
+  beforeEach(() => {
+    installApiStub();
+  });
+
+  function predictSocket() {
+    const sockets = globalThis.WebSocket.instances ?? [];
+    return sockets.find((s) => s.url.includes('/ws/predict'));
+  }
+
+  /**
+   * THE BUG 3 SYMPTOM, end to end.
+   *
+   * The state used to reach only the host, so the participant never saw this
+   * dialog and no enforcement ever started. installApiStub signs us in as user
+   * id 1 and the stubbed meeting's host is also id 1 — so for this test the
+   * meeting is re-stubbed with a DIFFERENT host, making us the participant.
+   */
+  it('shows the blocking dialog when the host switches it on mid-meeting', async () => {
+    const otherHost = {
+      id: 99, name: 'Dr R Manavalan', email: 'guide@example.com',
+      role: 'hearing', created_at: '2026-10-01T09:00:00',
+    };
+    installApiStub({ meeting: { ...MEETING, host: otherHost, is_interview_mode: false } });
+
+    renderPage(<MeetingRoom />, { path: '/meeting/:code', entry: '/meeting/K7Q-2M4' });
+    await screen.findByRole('button', { name: /Leave call/i });
+
+    // Not shown yet.
+    expect(screen.queryByText(/The host has turned on interview mode/i)).toBeNull();
+
+    const socket = await waitFor(() => {
+      const found = predictSocket();
+      expect(found).toBeTruthy();
+      return found;
+    });
+
+    await act(async () => {
+      socket.emit({
+        type: 'interview-mode',
+        meeting_code: 'K7Q-2M4',
+        is_interview_mode: true,
+        interview_mode_started_at: new Date().toISOString(),
+        host: { id: 99, name: 'Dr R Manavalan' },
+      });
+    });
+
+    // The wording the brief specifies, and the one button.
+    expect(
+      await screen.findByText(/The host has turned on interview mode/i),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: /Continue in full screen/i }),
+    ).toBeTruthy();
+  });
+
+  it('shows the dialog from the handshake, so reloading is not an escape', async () => {
+    const otherHost = {
+      id: 99, name: 'Dr R Manavalan', email: 'guide@example.com',
+      role: 'hearing', created_at: '2026-10-01T09:00:00',
+    };
+    // The meeting already has the mode on when this client loads it.
+    installApiStub({
+      meeting: {
+        ...MEETING,
+        host: otherHost,
+        is_interview_mode: true,
+        interview_mode_started_at: '2026-10-12T09:00:00',
+      },
+    });
+
+    renderPage(<MeetingRoom />, { path: '/meeting/:code', entry: '/meeting/K7Q-2M4' });
+
+    expect(
+      await screen.findByText(/The host has turned on interview mode/i),
+    ).toBeTruthy();
+  });
+
+  it("the participant's Leave button is disabled during an interview", async () => {
+    const otherHost = {
+      id: 99, name: 'Dr R Manavalan', email: 'guide@example.com',
+      role: 'hearing', created_at: '2026-10-01T09:00:00',
+    };
+    installApiStub({
+      meeting: {
+        ...MEETING,
+        host: otherHost,
+        is_interview_mode: true,
+        interview_mode_started_at: '2026-10-12T09:00:00',
+      },
+    });
+
+    renderPage(<MeetingRoom />, { path: '/meeting/:code', entry: '/meeting/K7Q-2M4' });
+
+    const leave = await screen.findByRole('button', {
+      name: /Only the host can end this interview/i,
+    });
+    expect(leave.disabled).toBe(true);
+  });
+
+  it('the host can still leave, and is not shown the dialog', async () => {
+    // Default stub: we ARE the host (id 1).
+    installApiStub({ meeting: { ...MEETING, is_interview_mode: true } });
+
+    renderPage(<MeetingRoom />, { path: '/meeting/:code', entry: '/meeting/K7Q-2M4' });
+
+    const leave = await screen.findByRole('button', { name: /Leave call/i });
+    expect(leave.disabled).toBe(false);
+    expect(screen.queryByText(/The host has turned on interview mode/i)).toBeNull();
   });
 });

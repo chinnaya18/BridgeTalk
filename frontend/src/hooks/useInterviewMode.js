@@ -136,11 +136,40 @@ export function useInterviewMode({
     }
   }, []);
 
-  /** The participant clicked "I understand". That click is the user gesture. */
+  /** The participant clicked "Continue in full screen". That click is the gesture. */
   const acknowledge = useCallback(async () => {
     setAcknowledged(true);
     await enterEnforcement();
   }, [enterEnforcement]);
+
+  /**
+   * Warn when the tab is being closed or reloaded.
+   *
+   * The right-click menu is already blocked by the detection effect below;
+   * this adds the other half of what the brief asks for.
+   *
+   * Be precise about what it does: `beforeunload` cannot PREVENT a close or a
+   * reload. The browser shows its own generic confirmation and the user may
+   * still proceed, and the message text is ignored by every modern browser. It
+   * is a speed bump that makes an accidental reload unlikely, nothing more.
+   *
+   * Active only while the mode is on, the participant is not the host, and
+   * they have acknowledged — so the host is never affected, and neither is an
+   * ordinary meeting.
+   */
+  useEffect(() => {
+    if (!enabled || isHost || !acknowledged) return undefined;
+
+    const warnOnLeave = (event) => {
+      event.preventDefault();
+      // Required for Chrome to show its dialog at all. The string is ignored.
+      event.returnValue = '';
+      return '';
+    };
+
+    window.addEventListener('beforeunload', warnOnLeave);
+    return () => window.removeEventListener('beforeunload', warnOnLeave);
+  }, [enabled, isHost, acknowledged]);
 
   // --- detection -----------------------------------------------------------
   useEffect(() => {
@@ -240,6 +269,10 @@ export function useInterviewMode({
     mustBlock: enabled && !isHost && acknowledged && (isAway || !isFullscreen),
     suppressBriefly,
     reEnterFullscreen: enterEnforcement,
+    // Called when the meeting ENDS, which is the only normal way out.
+    // Releases the keyboard lock and leaves fullscreen; without it the
+    // participant stays locked into a meeting that no longer exists.
+    releaseEnforcement: exitEnforcement,
     // Shown to the host, so "reduced enforcement" is a true statement about
     // this browser rather than a guess.
     reducedEnforcement: !capabilities.fullscreen || !capabilities.keyboardLock,

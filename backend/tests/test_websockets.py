@@ -439,3 +439,162 @@ def test_the_relay_vocabulary_is_still_closed(client, registered_user, meeting):
             if message.get("code") == "INVALID_MESSAGE":
                 return
         pytest.fail("an unknown signalling type was accepted")
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 — room-wide state changes must reach the OTHER participant
+# ---------------------------------------------------------------------------
+
+
+def _drain_until(socket, message_type, limit=10):
+    """Read messages until one of `message_type` arrives, or give up.
+
+    The predict socket sends `connected` first and may send `prediction` or
+    `error` messages, so a test cannot assume the next frame is the one it
+    wants.
+    """
+    for _ in range(limit):
+        message = socket.receive_json()
+        if message.get("type") == message_type:
+            return message
+    raise AssertionError(f"no {message_type!r} message arrived within {limit} frames")
+
+
+def _expect_broadcast(socket, message_type, limit=10):
+    """Assert a broadcast arrived, failing FAST if it did not.
+
+    WHY THE PING SENTINEL
+    ---------------------
+    `receive_json()` blocks. Draining for a message that is never sent hangs the
+    test run instead of failing it, which is how the first version of these
+    tests behaved when the broadcast was removed to check they bite — a hang is
+    technically a detection but a useless one.
+
+    A WebSocket delivers in order, so sending `ping` after the action under test
+    and watching for `pong` gives a deterministic end marker: if `pong` arrives
+    first, the broadcast did not happen, and the test fails with a readable
+    message rather than stalling.
+    """
+    socket.send_json({"type": "ping"})
+    for _ in range(limit):
+        message = socket.receive_json()
+        if message.get("type") == message_type:
+            return message
+        if message.get("type") == "pong":
+            raise AssertionError(
+                f"no {message_type!r} broadcast arrived — the ping sentinel came "
+                f"back first, so nothing was sent to this participant"
+            )
+    raise AssertionError(f"no {message_type!r} message arrived within {limit} frames")
+
+
+def test_switching_interview_mode_on_reaches_the_other_participant(
+    client, auth_headers, registered_user, second_user, meeting
+):
+    """THE BUG 3 REGRESSION TEST.
+
+    Interview Mode wrote the state to the meeting row and returned it to the
+    HOST, and nothing told anyone else. The other participant's client had
+    fetched the meeting once on mount and never read it again, so
+    `is_interview_mode` stayed false on their screen: no dialog, no fullscreen,
+    no enforcement. The feature worked only for the host.
+    """
+    guest_token = create_access_token(second_user["user"]["id"])
+    client.post(f"/api/meetings/{meeting['code']}/join", headers=auth_headers)
+
+    with client.websocket_connect(
+        f"/ws/predict/{meeting['code']}?token={guest_token}"
+    ) as guest_socket:
+        _drain_until(guest_socket, "connected")
+
+        # The HOST switches it on over REST.
+        response = client.patch(
+            f"/api/meetings/{meeting['code']}/interview-mode",
+            json={"enabled": True},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200, response.text
+
+        # The GUEST must be told, without asking.
+        announced = _expect_broadcast(guest_socket, "interview-mode")
+
+    assert announced["is_interview_mode"] is True
+    assert announced["meeting_code"] == meeting["code"]
+    assert announced["interview_mode_started_at"] is not None
+    assert announced["host"]["id"] == registered_user["user"]["id"]
+
+
+def test_ending_a_meeting_reaches_the_other_participant(
+    client, auth_headers, second_user, meeting
+):
+    """Ending the meeting is the only normal way out of interview mode.
+
+    The participant's client has to be told so it can release the keyboard
+    lock, leave fullscreen and remove its listeners. Without this the candidate
+    stays locked into a meeting that no longer exists.
+    """
+    guest_token = create_access_token(second_user["user"]["id"])
+
+    with client.websocket_connect(
+        f"/ws/predict/{meeting['code']}?token={guest_token}"
+    ) as guest_socket:
+        _drain_until(guest_socket, "connected")
+
+        response = client.post(
+            f"/api/meetings/{meeting['code']}/end", headers=auth_headers
+        )
+        assert response.status_code == 200, response.text
+
+        announced = _expect_broadcast(guest_socket, "meeting-ended")
+
+    assert announced["meeting_code"] == meeting["code"]
+    assert announced["ended_at"] is not None
+    assert announced["ended_by"]["id"] is not None
+
+
+def test_the_connected_handshake_carries_the_interview_state(
+    client, auth_headers, second_user
+):
+    """So a client that JOINS or RECONNECTS learns it without a live broadcast.
+
+    This is the other half of the fix: the broadcast covers everyone currently
+    connected, the handshake covers everyone who connects next. Reloading the
+    page must not be a way to escape the mode.
+    """
+    created = client.post(
+        "/api/meetings",
+        json={"title": "Already invigilated", "is_interview_mode": True},
+        headers=auth_headers,
+    ).json()
+    guest_token = create_access_token(second_user["user"]["id"])
+
+    with client.websocket_connect(
+        f"/ws/predict/{created['code']}?token={guest_token}"
+    ) as guest_socket:
+        connected = _drain_until(guest_socket, "connected")
+
+    assert connected["meeting"] is not None, "the handshake carried no room state"
+    assert connected["meeting"]["is_interview_mode"] is True
+    assert connected["meeting"]["interview_mode_started_at"] is not None
+    assert connected["meeting"]["ended_at"] is None
+
+
+def test_the_handshake_reports_interview_mode_off_when_it_is_off(
+    client, auth_headers, second_user, meeting
+):
+    guest_token = create_access_token(second_user["user"]["id"])
+    with client.websocket_connect(
+        f"/ws/predict/{meeting['code']}?token={guest_token}"
+    ) as guest_socket:
+        connected = _drain_until(guest_socket, "connected")
+
+    assert connected["meeting"]["is_interview_mode"] is False
+    assert connected["meeting"]["interview_mode_started_at"] is None
+
+
+def test_the_demo_code_has_no_room_state(client, registered_user):
+    """DEMO is not a real meeting, so there is no row to report."""
+    token = create_access_token(registered_user["user"]["id"])
+    with client.websocket_connect(f"/ws/predict/DEMO?token={token}") as socket:
+        connected = _drain_until(socket, "connected")
+    assert connected["meeting"] is None

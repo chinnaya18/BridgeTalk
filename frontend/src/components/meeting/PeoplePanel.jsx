@@ -24,6 +24,8 @@ export default function PeoplePanel({
   remoteStream,
   remoteSigning,
   connectionState,
+  violations = {},
+  interviewOn = false,
 }) {
   const remoteAudio = remoteStream?.getAudioTracks?.()[0];
   const remoteVideo = remoteStream?.getVideoTracks?.()[0];
@@ -31,12 +33,26 @@ export default function PeoplePanel({
   const remoteHasAudio = Boolean(remoteAudio && !remoteAudio.muted);
   const remoteHasVideo = Boolean(remoteVideo && !remoteVideo.muted);
 
+  // The violation tally is keyed by user id and only the host is sent the
+  // events, so this is empty for a participant and nothing extra renders.
+  const violationFor = (name) =>
+    Object.values(violations).find((entry) => entry.userName === name) ?? null;
+
   return (
-    <ul className="flex flex-col gap-1 pt-1">
+    <>
+      {/* Say what this list IS, so it is not read as the meeting's total
+          participant count — which is a different number, shown on Home and
+          History and counted over everyone who ever joined. */}
+      <p className="px-1 pb-2 pt-1 text-xs text-dark-muted">
+        Currently in this meeting
+      </p>
+      <ul className="flex flex-col gap-1">
       <Person
         name={localName}
         suffix="(you)"
         signing={localSigning}
+        violation={violationFor(localName)}
+        interviewOn={interviewOn}
         states={[
           localMuted
             ? { icon: 'mic_off', text: 'Microphone off', danger: true }
@@ -51,6 +67,8 @@ export default function PeoplePanel({
         <Person
           name={remoteName}
           signing={remoteSigning}
+          violation={violationFor(remoteName)}
+          interviewOn={interviewOn}
           states={[
             remoteHasAudio
               ? { icon: 'mic', text: 'Audio arriving' }
@@ -68,11 +86,12 @@ export default function PeoplePanel({
             : ''}
         </li>
       )}
-    </ul>
+      </ul>
+    </>
   );
 }
 
-function Person({ name, suffix, signing, states }) {
+function Person({ name, suffix, signing, states, violation, interviewOn }) {
   return (
     <li className="flex items-start gap-3 rounded-card px-1 py-2.5">
       <Avatar name={name} size={36} />
@@ -82,6 +101,24 @@ function Person({ name, suffix, signing, states }) {
           {suffix ? <span className="shrink-0 text-dark-muted">{suffix}</span> : null}
           {signing ? (
             <Icon name="sign_language" size={15} className="shrink-0 text-dark-accent" />
+          ) : null}
+          {/* The host's live violation count, beside the name. Only the host
+              is sent focus events, so this is absent for everyone else. */}
+          {interviewOn && violation && violation.awayCount > 0 ? (
+            <span
+              title={
+                violation.totalAwayMs > 0
+                  ? `Left the meeting screen ${violation.awayCount} time(s), ` +
+                    `${Math.round(violation.totalAwayMs / 1000)}s in total`
+                  : `Left the meeting screen ${violation.awayCount} time(s)`
+              }
+              className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-full
+                         bg-dark-danger/20 px-1.5 py-0.5 text-[11px] font-medium
+                         text-dark-danger"
+            >
+              <Icon name="warning" size={12} />
+              {violation.awayCount}
+            </span>
           ) : null}
         </p>
         <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">

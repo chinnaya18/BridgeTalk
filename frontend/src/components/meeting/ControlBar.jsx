@@ -45,7 +45,8 @@ export default function ControlBar({
   onOpenPanel,
   onOpenSettings,
   onToggleFullscreen,
-  onToggleInterviewMode,
+  onStartInterviewMode,
+  canLeave = true,
   onLeave,
   onEndForEveryone,
 }) {
@@ -150,16 +151,22 @@ export default function ControlBar({
             {isHost ? (
               <>
                 <MenuDivider />
+                {/* ONE-WAY. Once on it cannot be switched off: an interview
+                    that can be un-invigilated mid-session is not an interview,
+                    and a candidate who saw the mode turn off would reasonably
+                    assume the recording had stopped. Ending the meeting is the
+                    only way to finish it, and the server enforces this too. */}
                 <MenuItem
                   icon="policy"
-                  onClick={() => { setMoreOpen(false); onToggleInterviewMode(); }}
+                  disabled={interviewOn}
+                  onClick={() => { setMoreOpen(false); onStartInterviewMode(); }}
                   description={
                     interviewOn
-                      ? 'Stop recording when people leave the tab'
-                      : 'Record when people leave the meeting tab'
+                      ? 'Already on. End the meeting to finish the interview.'
+                      : 'Records when people leave the meeting tab. Cannot be undone.'
                   }
                 >
-                  {interviewOn ? 'Turn off interview mode' : 'Turn on interview mode'}
+                  {interviewOn ? 'Interview mode is on' : 'Turn on interview mode'}
                 </MenuItem>
               </>
             ) : null}
@@ -168,18 +175,42 @@ export default function ControlBar({
 
         {/* Leave. The host gets a choice, because "end for everyone" is
             destructive and must never be one click away from "leave". */}
-        <div className="relative ml-1">
+        {/* Leave. The host gets a choice, because "end for everyone" is
+            destructive and must never be one click away from "leave".
+
+            During an interview the PARTICIPANT cannot leave at all: ending the
+            meeting is the host's decision, and it is the only thing that
+            releases the keyboard lock and fullscreen. The button is disabled
+            with an explanation rather than hidden, so the candidate can see
+            why. */}
+        <div className="group relative ml-1 inline-flex">
           <button
             type="button"
             onClick={() => (isHost ? setLeaveOpen((open) => !open) : onLeave())}
-            aria-label="Leave call"
+            disabled={!canLeave}
+            aria-label={canLeave ? 'Leave call' : 'Only the host can end this interview'}
             aria-haspopup={isHost ? 'menu' : undefined}
             aria-expanded={isHost ? leaveOpen : undefined}
             className="grid h-12 place-items-center rounded-full bg-dark-danger px-6
-                       text-white transition hover:brightness-110"
+                       text-white transition hover:brightness-110
+                       disabled:cursor-not-allowed disabled:opacity-40
+                       disabled:hover:brightness-100"
           >
             <Icon name="call_end" size={24} />
           </button>
+
+          {!canLeave ? (
+            <span
+              role="tooltip"
+              className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2
+                         -translate-x-1/2 whitespace-nowrap rounded bg-[#202124] px-2
+                         py-1 text-xs font-medium text-white opacity-0 shadow-menu
+                         transition-opacity group-hover:opacity-100
+                         group-focus-within:opacity-100"
+            >
+              Only the host can end this interview
+            </span>
+          ) : null}
 
           {isHost ? (
             <Menu
@@ -187,14 +218,23 @@ export default function ControlBar({
               onClose={() => setLeaveOpen(false)}
               className="bottom-full mb-3 min-w-[260px]"
             >
-              <MenuItem icon="logout" onClick={() => { setLeaveOpen(false); onLeave(); }}>
-                Just leave the meeting
-              </MenuItem>
+              {/* Hidden during an interview: the host leaving without ending
+                  it would leave the candidate locked in fullscreen with no way
+                  out, which is the one state this feature must never reach. */}
+              {interviewOn ? null : (
+                <MenuItem icon="logout" onClick={() => { setLeaveOpen(false); onLeave(); }}>
+                  Just leave the meeting
+                </MenuItem>
+              )}
               <MenuItem
                 icon="call_end"
                 destructive
                 onClick={() => { setLeaveOpen(false); onEndForEveryone(); }}
-                description="Nobody will be able to rejoin"
+                description={
+                  interviewOn
+                    ? 'This ends the interview and releases the candidate. Nobody will be able to rejoin.'
+                    : 'Nobody will be able to rejoin'
+                }
               >
                 End meeting for everyone
               </MenuItem>

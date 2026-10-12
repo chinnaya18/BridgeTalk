@@ -1,5 +1,6 @@
 """Meeting endpoints: create, fetch, join, leave, end, history."""
 
+import logging
 import secrets
 from datetime import datetime, timezone
 
@@ -18,6 +19,7 @@ from app.schemas.focus import (
     InterviewModeUpdate,
     ParticipantViolations,
 )
+from app.ws.connection_manager import inference_manager, signaling_manager
 from app.schemas.meeting import (
     MeetingCreate,
     MeetingDetail,
@@ -25,6 +27,8 @@ from app.schemas.meeting import (
     MeetingPublic,
     MeetingSummary,
 )
+
+logger = logging.getLogger("bridgetalk.api.meetings")
 
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 
@@ -63,6 +67,40 @@ def generate_meeting_code(db: Session) -> str:
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="Could not allocate a unique meeting code, please retry",
     )
+
+
+async def _announce_to_room(code: str, message: dict) -> int:
+    """Push a room-wide state change to every connected participant.
+
+    WHY THIS EXISTS
+    ---------------
+    Interview Mode did not work, and this was the cause. The state was written
+    to the meeting record and returned to the HOST, and nothing told anyone
+    else. The other participant's client had fetched the meeting once on mount
+    and never read it again, so `is_interview_mode` stayed false on their
+    screen: no dialog, no fullscreen, no enforcement. The feature worked only
+    for the host — the one person it does not apply to.
+
+    Both managers are notified because a participant may have one socket open
+    and not the other: the inference socket is the meeting's text channel and
+    is always connected, while the signalling socket can be absent if the call
+    never established. Delivering to both means a state change does not depend
+    on which sockets happen to be up.
+
+    Returns the number of sockets that accepted it, which the caller logs
+    rather than acts on — a state change that reached nobody is still correctly
+    recorded on the meeting row, and any client that reconnects reads it from
+    the `connected` handshake.
+    """
+    delivered = 0
+    for manager in (inference_manager, signaling_manager):
+        try:
+            delivered += await manager.broadcast(code, message)
+        except Exception:  # noqa: BLE001
+            # A broadcast failure must never fail the request that caused it.
+            # The database is the source of truth; this is only the fast path.
+            logger.exception("Could not announce %s to room %s", message.get("type"), code)
+    return delivered
 
 
 def _load_meeting_by_code(db: Session, code: str) -> Meeting:
@@ -128,6 +166,18 @@ def create_meeting(payload: MeetingCreate, db: DbSession, current_user: CurrentU
         title=payload.title.strip(),
         host_id=current_user.id,
         is_interview_mode=payload.is_interview_mode,
+        # Stamped at creation when the mode is on from the start.
+        #
+        # Without this the flag was true while `interview_mode_started_at`
+        # stayed NULL, and the violation rollup filters on that timestamp — so
+        # a meeting created with the mode on filtered NOTHING and every focus
+        # event ever recorded counted as a violation. Found by a test that was
+        # asserting the opposite.
+        interview_mode_started_at=(
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            if payload.is_interview_mode
+            else None
+        ),
     )
     db.add(meeting)
     db.commit()
@@ -316,10 +366,10 @@ def leave_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Meetin
     response_model=MeetingDetail,
     summary="Switch Interview Mode on or off (host only)",
 )
-def set_interview_mode(
+async def set_interview_mode(
     code: str, payload: InterviewModeUpdate, db: DbSession, current_user: CurrentUser
 ) -> Meeting:
-    """Turn Interview Mode on or off during a meeting. Host only.
+    """Turn Interview Mode ON during a meeting. Host only, and one-way.
 
     WHY THE STATE LIVES ON THE MEETING RECORD
     -----------------------------------------
@@ -333,6 +383,15 @@ def set_interview_mode(
 
     Host only, for the same reason only the host can end a meeting: this
     changes what the other participants are subject to.
+
+    IT IS ONE-WAY
+    -------------
+    Once on, it cannot be switched off; `enabled: false` is rejected with 409.
+    An interview that can be un-invigilated mid-session is not an interview,
+    and a candidate who saw the mode turn off would reasonably assume the
+    recording had stopped. The only way out is the host ending the meeting,
+    which is also the only thing that releases the participant's keyboard lock
+    and fullscreen.
     """
     meeting = _load_meeting_by_code(db, code)
 
@@ -348,17 +407,57 @@ def set_interview_mode(
             detail="This meeting has ended",
         )
 
-    meeting.is_interview_mode = payload.enabled
-    # Stamped on each switch-on, so focus events recorded earlier in the
-    # meeting are not counted as violations of a mode that was not yet active.
-    # Cleared on switch-off so a later switch-on gets a fresh window.
-    meeting.interview_mode_started_at = (
-        datetime.now(timezone.utc).replace(tzinfo=None) if payload.enabled else None
-    )
+    if not payload.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Interview Mode cannot be switched off once it is on. "
+                "End the meeting to finish the interview."
+            ),
+        )
+
+    # Already on: do not re-stamp the start time, which would discard every
+    # violation recorded so far. Backfill it only if it is somehow missing, so
+    # a row predating the creation-time stamp above cannot leave the rollup
+    # filtering on NULL.
+    if meeting.is_interview_mode:
+        if meeting.interview_mode_started_at is None:
+            meeting.interview_mode_started_at = datetime.now(timezone.utc).replace(
+                tzinfo=None
+            )
+            db.commit()
+            db.refresh(meeting)
+        return _load_meeting_by_code(db, code)
+
+    meeting.is_interview_mode = True
+    # Stamped on switch-on, so focus events recorded earlier in the meeting are
+    # not counted as violations of a mode that was not yet active.
+    meeting.interview_mode_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     db.commit()
     db.refresh(meeting)
-    return _load_meeting_by_code(db, code)
+    fresh = _load_meeting_by_code(db, code)
+
+    # THE FIX FOR BUG 3. Without this the state reached only the host.
+    delivered = await _announce_to_room(
+        meeting.code,
+        {
+            "type": "interview-mode",
+            "meeting_code": meeting.code,
+            "is_interview_mode": True,
+            "interview_mode_started_at": (
+                fresh.interview_mode_started_at.isoformat()
+                if fresh.interview_mode_started_at
+                else None
+            ),
+            "host": {"id": current_user.id, "name": current_user.name},
+        },
+    )
+    logger.info(
+        "Interview Mode on for %s, announced to %d socket(s)", meeting.code, delivered
+    )
+
+    return fresh
 
 
 @router.post(
@@ -367,7 +466,7 @@ def set_interview_mode(
     status_code=status.HTTP_201_CREATED,
     summary="Log an Interview Mode focus change",
 )
-def log_focus_event(
+async def log_focus_event(
     code: str, payload: FocusEventCreate, db: DbSession, current_user: CurrentUser
 ) -> FocusEventPublic:
     """Record that the caller's window lost or regained focus.
@@ -404,7 +503,7 @@ def log_focus_event(
     db.commit()
     db.refresh(event)
 
-    return FocusEventPublic(
+    public = FocusEventPublic(
         id=event.id,
         meeting_id=event.meeting_id,
         user_id=event.user_id,
@@ -413,6 +512,34 @@ def log_focus_event(
         duration_away_ms=event.duration_away_ms,
         created_at=event.created_at,
     )
+
+    # Tell the HOST, in real time, and only the host.
+    #
+    # A violation is a record *about* a participant, so broadcasting it to the
+    # room would show one candidate another candidate's lapses — which is
+    # surveillance of each other rather than a tool for the person running the
+    # interview, and it is exactly why GET /focus-events is host-only.
+    #
+    # The host's own focus changes are not reported: they are not policed, and
+    # alerting them about their own tab switches would be noise.
+    if current_user.id != meeting.host_id:
+        for manager in (inference_manager, signaling_manager):
+            try:
+                await manager.send_to_user(
+                    meeting.code,
+                    meeting.host_id,
+                    {
+                        "type": "focus-event",
+                        "meeting_code": meeting.code,
+                        "event": public.model_dump(mode="json"),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                # The row is already committed and the host can still read the
+                # log; a failed notification must not fail the request.
+                logger.exception("Could not notify host of a focus event")
+
+    return public
 
 
 @router.get(
@@ -449,6 +576,11 @@ def get_focus_events(code: str, db: DbSession, current_user: CurrentUser) -> Foc
             user_id=row.user_id,
             user_name=row.user.name,
             event_type=row.event_type,
+            # Issue K-3: this was omitted, so it defaulted to None and the
+            # host's interview log showed an em dash for every duration even
+            # though the database held the value — and the by_participant
+            # rollup below read it correctly from the same rows.
+            duration_away_ms=row.duration_away_ms,
             created_at=row.created_at,
         )
         for row in rows
@@ -500,7 +632,7 @@ def get_focus_events(code: str, db: DbSession, current_user: CurrentUser) -> Foc
 
 
 @router.post("/{code}/end", response_model=MeetingDetail, summary="End a meeting (host only)")
-def end_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Meeting:
+async def end_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Meeting:
     """Close a meeting for everyone. Host only.
 
     Restricted to the host because ending a meeting makes its code unusable —
@@ -530,5 +662,26 @@ def end_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Meeting:
             participant.left_at = now
 
     db.commit()
+    fresh = _load_meeting_by_code(db, code)
 
-    return _load_meeting_by_code(db, code)
+    # Announce the end to the room.
+    #
+    # For an ordinary meeting this is a courtesy — the other client would
+    # discover it on its next request. For an INTERVIEW it is required: ending
+    # the meeting is the only normal way out of interview mode, and the
+    # participant's client has to be told so it can release the keyboard lock,
+    # leave fullscreen, remove its listeners and move to the ended page. Without
+    # this the candidate stays locked in a meeting that no longer exists.
+    delivered = await _announce_to_room(
+        meeting.code,
+        {
+            "type": "meeting-ended",
+            "meeting_code": meeting.code,
+            "ended_at": fresh.ended_at.isoformat() if fresh.ended_at else None,
+            "ended_by": {"id": current_user.id, "name": current_user.name},
+            "was_interview_mode": bool(fresh.is_interview_mode),
+        },
+    )
+    logger.info("Meeting %s ended, announced to %d socket(s)", meeting.code, delivered)
+
+    return fresh

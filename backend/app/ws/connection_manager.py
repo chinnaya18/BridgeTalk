@@ -124,6 +124,43 @@ class ConnectionManager:
 
         return delivered
 
+    async def send_to_user(self, meeting_code: str, user_id: int, message: dict) -> int:
+        """Send to one specific user's sockets in a meeting.
+
+        WHY THIS IS NOT A BROADCAST
+        ---------------------------
+        Interview Mode violations are reported to the HOST in real time. A
+        violation is a record *about* a participant, so broadcasting it to the
+        room would show one candidate another candidate's lapses — which is
+        surveillance of each other rather than a tool for the person running
+        the interview, and it is exactly why `GET /focus-events` is host-only.
+
+        A user may legitimately have more than one socket on a channel (a
+        second tab), so every matching connection is sent to.
+
+        Returns the number of sockets that accepted it.
+        """
+        async with self._lock:
+            recipients = [
+                connection
+                for connection in self._rooms.get(meeting_code, [])
+                if connection.user_id == user_id
+            ]
+
+        delivered = 0
+        dead: list[Connection] = []
+        for connection in recipients:
+            try:
+                await connection.websocket.send_json(message)
+                delivered += 1
+            except Exception:  # noqa: BLE001
+                dead.append(connection)
+
+        for connection in dead:
+            await self.disconnect(connection)
+
+        return delivered
+
     async def peers(self, meeting_code: str, exclude: Optional[Connection] = None) -> list[Connection]:
         """Everyone else currently in this meeting."""
         async with self._lock:

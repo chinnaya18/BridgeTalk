@@ -27,6 +27,7 @@ import { useSpeechCaptions } from '../hooks/useSpeechCaptions';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { meetings as meetingsApi, transcripts as transcriptsApi } from '../services/api';
 import { loadDevicePreferences, saveDevicePreferences } from '../services/devicePreferences';
+import { formatElapsed } from '../utils/formatters';
 import { toWireFormat } from '../utils/landmarkUtils';
 
 /**
@@ -68,6 +69,10 @@ export default function MeetingRoom() {
   const navigate = useNavigate();
   const { user } = useAuth();
   const toast = useToast();
+  // Held in a ref so callbacks declared above the socket can raise a toast
+  // without taking `toast` as a dependency and re-creating themselves.
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
 
   // ?debug=1 only. "I spoke and nothing happened" is not a reportable bug
   // without knowing which stage died.
@@ -109,6 +114,14 @@ export default function MeetingRoom() {
   const [captionsVisible, setCaptionsVisible] = useState(true);
   const [micOn, setMicOn] = useState(initialDevices.micOn !== false);
   const [cameraOn, setCameraOn] = useState(initialDevices.cameraOn !== false);
+
+  // Set when the server announces the meeting has ended. Drives the teardown
+  // effect below, which is the only normal way out of Interview Mode.
+  const [meetingEndedBy, setMeetingEndedBy] = useState(null);
+
+  // Per-participant violation tally, built from the live focus-event stream.
+  // Host-only: nobody else is sent these.
+  const [violations, setViolations] = useState({});
 
   const [openPanel, setOpenPanel] = useState(null); // null | details | people | transcript
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -280,6 +293,96 @@ export default function MeetingRoom() {
     [applyCaption],
   );
 
+  /**
+   * Room state, from the socket handshake or a live broadcast.
+   *
+   * THE FIX FOR BUG 3. Interview Mode wrote the state to the meeting row and
+   * returned it to the HOST; nothing told anyone else, and this component
+   * fetched the meeting once on mount and never read it again. So
+   * `interviewOn` stayed false on the participant's screen and none of the
+   * enforcement below ever ran — the feature worked only for the host, the one
+   * person it does not apply to.
+   *
+   * Merged into the existing record rather than replacing it, because the
+   * announcement carries only the room-level fields.
+   *
+   * DECLARED ABOVE useSignSocket deliberately: `const` bindings sit in the
+   * temporal dead zone until their initialiser runs, so passing this to the
+   * hook above its own declaration would throw during render.
+   */
+  const applyRoomState = useCallback((state) => {
+    if (!state) return;
+    setMeeting((current) => {
+      if (!current) return current;
+      const next = {
+        ...current,
+        is_interview_mode:
+          // One-way: once on it stays on, so a stale `false` from a race
+          // between the handshake and a live broadcast cannot turn it off.
+          current.is_interview_mode || Boolean(state.is_interview_mode),
+        interview_mode_started_at:
+          state.interview_mode_started_at ?? current.interview_mode_started_at,
+      };
+      if (state.ended_at) next.ended_at = state.ended_at;
+      return next;
+    });
+  }, []);
+
+  const handleMeetingEnded = useCallback(
+    (message) => {
+      setMeetingEndedBy(message?.ended_by?.name ?? null);
+    },
+    [],
+  );
+
+  /**
+   * An Interview Mode violation, pushed to the host in real time.
+   *
+   * Pushed rather than polled: the host acts on this by talking to the
+   * candidate, so a five-second poll is five seconds of a conversation already
+   * going wrong. Only the host's socket receives it.
+   *
+   * `blur` and `hidden` are departures and increment the count; `return` is the
+   * recovery and carries the duration, so it updates the total without counting
+   * as another offence — the same rule the server's rollup uses.
+   */
+  const handleFocusEvent = useCallback(
+    (event) => {
+      if (!event) return;
+      const isDeparture = event.event_type === 'blur' || event.event_type === 'hidden';
+
+      setViolations((current) => {
+        const existing = current[event.user_id] ?? {
+          userName: event.user_name,
+          awayCount: 0,
+          totalAwayMs: 0,
+        };
+        return {
+          ...current,
+          [event.user_id]: {
+            userName: event.user_name ?? existing.userName,
+            awayCount: existing.awayCount + (isDeparture ? 1 : 0),
+            totalAwayMs: existing.totalAwayMs + (event.duration_away_ms ?? 0),
+          },
+        };
+      });
+
+      if (isDeparture) {
+        toastRef.current?.show(`${event.user_name} left the meeting screen`, {
+          icon: 'warning',
+        });
+      } else if (event.duration_away_ms != null) {
+        toastRef.current?.show(
+          `${event.user_name} came back after ${formatElapsed(
+            Math.round(event.duration_away_ms / 1000),
+          )}`,
+          { icon: 'policy' },
+        );
+      }
+    },
+    [],
+  );
+
   const {
     status: signSocketStatus,
     prediction,
@@ -293,6 +396,9 @@ export default function MeetingRoom() {
     meetingCode: code,
     enabled: Boolean(meeting),
     onCaption: applyAndRecord,
+    onRoomState: applyRoomState,
+    onMeetingEnded: handleMeetingEnded,
+    onFocusEvent: handleFocusEvent,
   });
 
   // Producers hand captions to the socket. They never touch the store directly:
@@ -610,19 +716,59 @@ export default function MeetingRoom() {
     maxViolations: MAX_VIOLATIONS,
   });
 
-  const toggleInterviewMode = useCallback(async () => {
-    if (!isHost) return;
+  /**
+   * Switch Interview Mode ON. One-way, and host only.
+   *
+   * It cannot be switched off: an interview that can be un-invigilated
+   * mid-session is not an interview, and a candidate who saw the mode turn off
+   * would reasonably assume the recording had stopped. The server rejects
+   * `enabled: false` with 409. The only way out is ending the meeting.
+   */
+  const startInterviewMode = useCallback(async () => {
+    if (!isHost || interviewOn) return;
     try {
-      const updated = await meetingsApi.setInterviewMode(code, !interviewOn);
+      const updated = await meetingsApi.setInterviewMode(code, true);
       setMeeting(updated);
-      toast.show(
-        updated.is_interview_mode ? 'Interview mode is on' : 'Interview mode is off',
-        { icon: 'policy' },
-      );
+      toast.show('Interview mode is on for everyone', { icon: 'policy' });
     } catch (cause) {
-      toast.show(cause?.message ?? 'Could not change interview mode', { icon: 'error' });
+      toast.show(cause?.message ?? 'Could not start interview mode', { icon: 'error' });
     }
   }, [code, interviewOn, isHost, toast]);
+
+  /**
+   * The meeting ended, announced by the server.
+   *
+   * This is the ONLY normal way out of Interview Mode, so the teardown has to
+   * be complete: release the keyboard lock, leave fullscreen, and leave the
+   * page. Without it a candidate stays locked into a meeting that no longer
+   * exists, with browser shortcuts still captured.
+   */
+  useEffect(() => {
+    if (!meetingEndedBy) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        await interview.releaseEnforcement?.();
+      } catch {
+        // Nothing to release, or the browser refused. Leaving anyway.
+      }
+      hangUp();
+      if (!cancelled) {
+        navigate(`/ended/${code}`, {
+          replace: true,
+          state: { endedByHost: true, endedBy: meetingEndedBy },
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // `interview` is intentionally omitted: it changes identity on every
+    // violation, and re-running this effect would navigate twice.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meetingEndedBy, code, hangUp, navigate]);
 
   // --- screen sharing ------------------------------------------------------
   const screenShare = useScreenShare({ addScreenTrack, removeScreenSender, sendSignal });
@@ -938,6 +1084,10 @@ export default function MeetingRoom() {
               remoteStream={remoteStream}
               remoteSigning={remoteActivity?.source === 'sign'}
               connectionState={connectionState}
+              // Host-only: nobody else is sent focus events, so this is empty
+              // for a participant and the panel renders nothing extra.
+              violations={violations}
+              interviewOn={interviewOn}
             />
           ) : null}
           {openPanel === 'transcript' ? (
@@ -980,7 +1130,8 @@ export default function MeetingRoom() {
         onOpenPanel={(panel) => setOpenPanel((current) => (current === panel ? null : panel))}
         onOpenSettings={() => setSettingsOpen(true)}
         onToggleFullscreen={toggleFullscreen}
-        onToggleInterviewMode={toggleInterviewMode}
+        onStartInterviewMode={startInterviewMode}
+        canLeave={!interviewOn || isHost}
         onLeave={() => leaveMeeting()}
         onEndForEveryone={() => leaveMeeting({ endForEveryone: true })}
       />

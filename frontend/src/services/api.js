@@ -6,8 +6,39 @@
  * calls `fetch` directly is a bug.
  */
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
-const WS_BASE_URL = import.meta.env.VITE_WS_BASE_URL ?? 'ws://localhost:8000';
+/**
+ * Where the API lives.
+ *
+ * SAME-ORIGIN MODE, AND WHY IT IS NEEDED
+ * --------------------------------------
+ * An EMPTY `VITE_API_BASE_URL` means "same origin as this page", so requests go
+ * to `/api/...` and are served by whatever is hosting the app.
+ *
+ * That is what makes two-device testing work. `npm run dev:lan` proxies `/api`
+ * and `/ws` through Vite, but a hardcoded `http://localhost:8000` defeats the
+ * proxy entirely: on the SECOND device `localhost` is that device, not the one
+ * running the backend, so every request fails with a connection error and the
+ * app looks completely broken.
+ *
+ * An unset variable still falls back to `http://localhost:8000`, so a plain
+ * `npm run dev` is unchanged.
+ */
+const RAW_API_BASE = import.meta.env.VITE_API_BASE_URL;
+const RAW_WS_BASE = import.meta.env.VITE_WS_BASE_URL;
+
+/** `wss://host` behind HTTPS, `ws://host` otherwise. Getting this wrong is a
+ *  mixed-content error the browser blocks with no useful message. */
+function sameOriginWebSocketBase() {
+  if (typeof window === 'undefined') return 'ws://localhost:8000';
+  const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${scheme}//${window.location.host}`;
+}
+
+// `''` is a deliberate value, not a missing one, so `??` is not enough here.
+const API_BASE_URL =
+  RAW_API_BASE === '' ? '' : (RAW_API_BASE ?? 'http://localhost:8000');
+const WS_BASE_URL =
+  RAW_WS_BASE === '' ? sameOriginWebSocketBase() : (RAW_WS_BASE ?? 'ws://localhost:8000');
 
 const TOKEN_KEY = 'bridgetalk.token';
 

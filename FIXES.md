@@ -841,6 +841,23 @@ interaction records a violation, and both windows share one microphone.
 | **HTTPS** via `@vitejs/plugin-basic-ssl@2.1.0` | `getUserMedia` requires a secure context and only `localhost` is exempt; over plain `http://192.168.x.x` the camera prompt never appears |
 | A **proxy** for `/api`, `/ws` and `/health` | One address, one certificate. Without it the browser must also accept a second self-signed certificate for the backend, which it will not do silently for a WebSocket — the socket fails with no usable error. `ws: true` is what performs the upgrade |
 
+**A gap found when actually running it.** The proxy alone was not enough: the
+app read `VITE_API_BASE_URL=http://localhost:8000` from `.env`, and on the
+SECOND device `localhost` is that device — so every request failed with a
+connection error and the proxy was never used. `services/api.js` now treats an
+**empty** `VITE_API_BASE_URL` as "same origin", and `dev:lan` sets both URL
+variables empty. An unset variable still falls back to `localhost:8000`, so a
+plain `npm run dev` is unchanged.
+
+Verified over the LAN from a second browser context:
+
+| Check | Result |
+|---|---|
+| `https://192.168.x.x:5173/` | 200 |
+| `/health` through the Vite proxy | 200, database connected |
+| Login through the real form | Succeeds; requests go to `https://192.168.x.x:5173/api/…`, **not** `localhost:8000` |
+| `wss://192.168.x.x:5173/ws/predict/DEMO` | `connected`, all three models loaded |
+
 `.env.example` documents adding the LAN origin to `CORS_ORIGINS`, and the README
 has the full steps under **"Testing with two devices"**.
 

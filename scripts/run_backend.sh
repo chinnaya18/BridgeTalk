@@ -27,6 +27,16 @@ if [ ! -f ".env" ]; then
 fi
 
 # Read host/port from .env if present, otherwise fall back to the defaults.
+# Keep CORS_ORIGINS pointed at this machine's current LAN address.
+#
+# The IP changes whenever the laptop joins a different network, and a stale
+# entry has a confusing symptom: the other device loads the page and then
+# cannot sign in, because the backend rejects the request before it reaches any
+# handler. Doing it here means simply starting the app keeps it correct.
+#
+# Never fatal: if there is no network, the script says so and leaves .env alone.
+"$SCRIPT_DIR/set-lan-ip.sh" || true
+
 HOST="$(grep -E '^BACKEND_HOST=' .env | cut -d= -f2- || true)"
 PORT="$(grep -E '^BACKEND_PORT=' .env | cut -d= -f2- || true)"
 HOST="${HOST:-0.0.0.0}"

@@ -126,10 +126,21 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
+    # Development only, and off unless CORS_ALLOW_LAN=true. Accepts any
+    # private-network address on the Vite dev port, so a second device keeps
+    # working when DHCP changes this machine's address mid-session. See
+    # config.py for why that is tolerable in development and not in production.
+    allow_origin_regex=settings.cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if settings.cors_allow_lan:
+    logger.warning(
+        "CORS_ALLOW_LAN is on: any private-network origin on :5173 is accepted. "
+        "This is for two-device development. Turn it off for anything deployed."
+    )
 
 app.include_router(auth.router)
 app.include_router(meetings.router)

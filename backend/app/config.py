@@ -52,6 +52,31 @@ class Settings(BaseSettings):
     # awkward CORS_ORIGINS=["http://..."] syntax in .env.
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
+    # DEVELOPMENT ONLY. Accept any private-network address on the dev port, so
+    # the allowlist does not have to be edited every time DHCP hands out a new
+    # address.
+    #
+    # WHY THIS EXISTS
+    # ---------------
+    # Testing with a second device needs this machine's LAN address in
+    # CORS_ORIGINS, and on a short DHCP lease that address changes often — it
+    # changed three times in ten minutes while this was being set up. A stale
+    # entry has a confusing symptom: the other device loads the page and then
+    # cannot sign in, because the request is rejected before it reaches any
+    # handler.
+    #
+    # WHY IT IS SAFE ENOUGH FOR DEVELOPMENT, AND NOT FOR PRODUCTION
+    # -------------------------------------------------------------
+    # The pattern matches only RFC 1918 private ranges — 10.x, 172.16–31.x,
+    # 192.168.x — and only on the Vite dev port. Those addresses are not
+    # routable from the internet, so no external site can match it. It is still
+    # wider than an explicit allowlist, which is why it defaults to FALSE and
+    # must be switched on deliberately.
+    #
+    # It never becomes a wildcard: `allow_origins=["*"]` with
+    # `allow_credentials=True` is rejected by browsers anyway.
+    cors_allow_lan: bool = False
+
     # --- Machine learning -------------------------------------------------
     static_model_path: str = "ml/models/static_model.keras"
     dynamic_model_path: str = "ml/models/dynamic_model.keras"
@@ -128,6 +153,24 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         """`CORS_ORIGINS` split into the list FastAPI's middleware expects."""
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def cors_origin_regex(self) -> str | None:
+        """A regex for private-network dev origins, or None when switched off.
+
+        Both schemes are allowed because the dev server runs over https in LAN
+        mode (`npm run dev:lan`) and http otherwise, and a developer should not
+        have to think about which.
+        """
+        if not self.cors_allow_lan:
+            return None
+        return (
+            r"^https?://("
+            r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+            r"|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+            r"|192\.168\.\d{1,3}\.\d{1,3}"
+            r"):5173$"
+        )
 
     @property
     def is_sqlite(self) -> bool:

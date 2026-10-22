@@ -97,11 +97,33 @@ export function useScreenShare({
     track.addEventListener('ended', () => stop(true));
 
     streamRef.current = stream;
+
+    // ANNOUNCE FIRST, THEN ADD THE TRACK. The comment here always said
+    // "announce before the track arrives", but the code added the track first
+    // and announced afterwards.
+    //
+    // `addTrack` fires `onnegotiationneeded`, which sends an offer; the track
+    // itself reaches the far side once that offer is answered. Announcing
+    // first means the receiver already knows which stream id is the screen
+    // when `ontrack` fires, instead of filing it as the camera and replacing
+    // the presenter's face with their own desktop.
+    //
+    // Both messages go over the same WebSocket, so ordering was usually
+    // preserved anyway — but "usually" is doing too much work for something
+    // this cheap to make certain.
+    sendSignal?.({ type: 'presentation-start', payload: { stream_id: stream.id } });
+
     senderRef.current = addScreenTrack?.(track, stream) ?? null;
 
-    // Announce BEFORE the track arrives, so the receiver knows which stream id
-    // is the screen and can route it rather than guessing from arrival order.
-    sendSignal?.({ type: 'presentation-start', payload: { stream_id: stream.id } });
+    // addScreenTrack returns null when there is no peer connection — nobody
+    // else has joined yet, or the call dropped. The local preview still works,
+    // which is exactly how this looks from the presenter's side, so say so
+    // rather than letting them believe the far side can see it.
+    if (!senderRef.current) {
+      setError(
+        'Your screen is not reaching the other participant — the call is not connected.',
+      );
+    }
 
     setIsPresenting(true);
     onChangeRef.current?.(true);

@@ -495,3 +495,154 @@ def test_each_event_in_the_log_carries_its_duration(client, auth_headers):
     assert by_type["hidden"]["duration_away_ms"] is None
     # And the rollup still agrees, as it always did.
     assert summary["by_participant"][0]["total_away_ms"] == 4200
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 — leaving the meeting screen: warn once, then remove
+# ---------------------------------------------------------------------------
+
+
+def _interview_meeting(client, auth_headers, second_headers):
+    """A meeting with interview mode on and both people in it."""
+    meeting = client.post(
+        "/api/meetings", json={"title": "Interview"}, headers=auth_headers
+    ).json()
+    code = meeting["code"]
+    client.post(f"/api/meetings/{code}/join", headers=auth_headers)
+    client.post(f"/api/meetings/{code}/join", headers=second_headers)
+    client.patch(
+        f"/api/meetings/{code}/interview-mode",
+        json={"enabled": True},
+        headers=auth_headers,
+    )
+    return meeting
+
+
+def _depart(client, code, headers):
+    return client.post(
+        f"/api/meetings/{code}/focus-events",
+        json={"event_type": "blur"},
+        headers=headers,
+    )
+
+
+def test_first_departure_warns_rather_than_removing(
+    client, auth_headers, second_headers
+):
+    meeting = _interview_meeting(client, auth_headers, second_headers)
+    first = _depart(client, meeting["code"], second_headers)
+
+    assert first.status_code == 201, first.text
+    assert first.json()["action"] == "warned"
+    assert first.json()["departures"] == 1
+
+    # And they are still in the meeting.
+    rejoin = client.post(
+        f"/api/meetings/{meeting['code']}/join", headers=second_headers
+    )
+    assert rejoin.status_code == 200
+
+
+def test_second_departure_removes_them(client, auth_headers, second_headers):
+    meeting = _interview_meeting(client, auth_headers, second_headers)
+    _depart(client, meeting["code"], second_headers)
+    second = _depart(client, meeting["code"], second_headers)
+
+    assert second.status_code == 201, second.text
+    assert second.json()["action"] == "removed"
+    assert second.json()["departures"] == 2
+
+
+def test_a_removed_participant_cannot_rejoin(client, auth_headers, second_headers):
+    """Removal is final. Reloading the page must not get them back in."""
+    meeting = _interview_meeting(client, auth_headers, second_headers)
+    _depart(client, meeting["code"], second_headers)
+    _depart(client, meeting["code"], second_headers)
+
+    rejoin = client.post(
+        f"/api/meetings/{meeting['code']}/join", headers=second_headers
+    )
+    assert rejoin.status_code == 403, rejoin.text
+    assert "removed" in rejoin.json()["detail"].lower()
+
+    # Still refused on a later attempt — it is not a one-off.
+    again = client.post(
+        f"/api/meetings/{meeting['code']}/join", headers=second_headers
+    )
+    assert again.status_code == 403
+
+
+def test_the_host_is_never_removed_by_their_own_rule(
+    client, auth_headers, second_headers
+):
+    """The host runs the interview; they are not policed by it."""
+    meeting = _interview_meeting(client, auth_headers, second_headers)
+    for _ in range(4):
+        response = _depart(client, meeting["code"], auth_headers)
+        assert response.json()["action"] == "none", response.text
+
+    rejoin = client.post(f"/api/meetings/{meeting['code']}/join", headers=auth_headers)
+    assert rejoin.status_code == 200
+
+
+def test_departures_outside_interview_mode_do_nothing(
+    client, auth_headers, second_headers
+):
+    meeting = client.post(
+        "/api/meetings", json={"title": "Ordinary"}, headers=auth_headers
+    ).json()
+    client.post(f"/api/meetings/{meeting['code']}/join", headers=second_headers)
+
+    # focus-events are refused entirely when the mode is off.
+    response = _depart(client, meeting["code"], second_headers)
+    assert response.status_code == 409
+
+
+def test_a_return_event_is_never_an_offence(client, auth_headers, second_headers):
+    """Coming back is the recovery, not another departure."""
+    meeting = _interview_meeting(client, auth_headers, second_headers)
+    _depart(client, meeting["code"], second_headers)
+
+    came_back = client.post(
+        f"/api/meetings/{meeting['code']}/focus-events",
+        json={"event_type": "return", "duration_away_ms": 3000},
+        headers=second_headers,
+    )
+    assert came_back.json()["action"] == "none"
+
+    # Still in the meeting after returning.
+    assert client.post(
+        f"/api/meetings/{meeting['code']}/join", headers=second_headers
+    ).status_code == 200
+
+
+def test_both_the_warning_and_the_removal_are_written_to_the_transcript(
+    client, auth_headers, second_headers
+):
+    """The transcript must account for what HAPPENED, not only what was said."""
+    meeting = _interview_meeting(client, auth_headers, second_headers)
+    _depart(client, meeting["code"], second_headers)
+    _depart(client, meeting["code"], second_headers)
+
+    lines = client.get(f"/api/transcripts/{meeting['id']}", headers=auth_headers).json()
+    system = [line for line in lines if line["source"] == "system"]
+
+    assert len(system) == 2, [line["content"] for line in system]
+    assert "warned" in system[0]["content"].lower()
+    assert "removed" in system[1]["content"].lower()
+    # Attributed to the participant they concern, not to the host.
+    assert all(line["user_name"] == "Thamizhthilaga S D S" for line in system)
+
+
+def test_system_lines_are_attributed_and_have_a_segment_id(
+    client, auth_headers, second_headers
+):
+    """So they are covered by the same idempotency index as every other line."""
+    meeting = _interview_meeting(client, auth_headers, second_headers)
+    _depart(client, meeting["code"], second_headers)
+
+    lines = client.get(f"/api/transcripts/{meeting['id']}", headers=auth_headers).json()
+    system = [line for line in lines if line["source"] == "system"]
+    assert system
+    assert system[0]["segment_id"], "a system line must carry a segment_id"
+    assert system[0]["confidence"] is None

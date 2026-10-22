@@ -92,6 +92,10 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
   // The stream id the remote peer announced as its screen share, so an
   // inbound track can be routed to the right tile.
   const screenStreamIdRef = useRef(null);
+  // Whether the other participant is currently in the signalling room, and
+  // whether we owe them an offer that was deferred because they were not.
+  const hasPeerRef = useRef(false);
+  const negotiationPendingRef = useRef(false);
 
   /**
    * Swap the outgoing video track without renegotiating.
@@ -190,6 +194,8 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
   // the description lands.
   const pendingCandidatesRef = useRef([]);
   const intentionalCloseRef = useRef(false);
+  // Our own user id, kept so politeness can be settled when a peer arrives.
+  const selfIdRef = useRef(null);
 
   const [remoteStream, setRemoteStream] = useState(null);
   const [remoteScreenStream, setRemoteScreenStream] = useState(null);
@@ -203,6 +209,45 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
     const socket = socketRef.current;
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
   }, []);
+
+  /**
+   * Create and send an offer — but only once there is somebody to send it to.
+   *
+   * `onnegotiationneeded` fires as soon as the local tracks are added, which
+   * is before the other participant has necessarily joined. Offering into an
+   * empty room is NOT harmless: the server drops the offer (it replies
+   * `no-peers`), but this connection stays in `have-local-offer` for good.
+   * When the other side finally joins and offers properly, that stale local
+   * offer looks like an offer collision — and if this peer is the impolite
+   * one, it ignores the real offer. Nobody answers, and the call never
+   * connects at all: both peers sit in `have-local-offer`, connectionState
+   * `new`, with no video either way and no screen share possible.
+   *
+   * So the offer is deferred until a peer is actually present, and replayed
+   * from `peer-joined`.
+   */
+  const negotiate = useCallback(async () => {
+    const connection = peerRef.current;
+    if (!connection) return;
+    if (!hasPeerRef.current) {
+      negotiationPendingRef.current = true;
+      return;
+    }
+    negotiationPendingRef.current = false;
+    try {
+      makingOfferRef.current = true;
+      // No argument: setLocalDescription() with no description creates the
+      // right kind (offer or answer) for the current signalling state. Doing
+      // it manually is where renegotiation bugs come from.
+      await connection.setLocalDescription();
+      send({ type: 'offer', payload: connection.localDescription });
+    } catch {
+      // A failed renegotiation leaves the existing call intact; the new track
+      // simply is not received.
+    } finally {
+      makingOfferRef.current = false;
+    }
+  }, [send]);
 
   /** Build the RTCPeerConnection and wire up its events. */
   const createPeerConnection = useCallback(() => {
@@ -237,20 +282,8 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
 
     // Fires whenever the set of tracks changes — which is exactly what
     // starting and stopping a screen share does.
-    connection.onnegotiationneeded = async () => {
-      try {
-        makingOfferRef.current = true;
-        // No argument: setLocalDescription() with no description creates the
-        // right kind (offer or answer) for the current signalling state. Doing
-        // it manually is where renegotiation bugs come from.
-        await connection.setLocalDescription();
-        send({ type: 'offer', payload: connection.localDescription });
-      } catch {
-        // A failed renegotiation leaves the existing call intact; the new
-        // track simply is not received.
-      } finally {
-        makingOfferRef.current = false;
-      }
+    connection.onnegotiationneeded = () => {
+      void negotiate();
     };
 
     connection.onicecandidate = (event) => {
@@ -274,7 +307,7 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
 
     peerRef.current = connection;
     return connection;
-  }, [localStream, send]);
+  }, [localStream, send, negotiate]);
 
   const flushPendingCandidates = useCallback(async (connection) => {
     for (const candidate of pendingCandidatesRef.current) {
@@ -288,11 +321,14 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
   }, []);
 
   const startCall = useCallback(async () => {
-    const connection = createPeerConnection();
-    const offer = await connection.createOffer();
-    await connection.setLocalDescription(offer);
-    send({ type: 'offer', payload: offer });
-  }, [createPeerConnection, send]);
+    // Only make sure the connection exists. Adding the local tracks fires
+    // `onnegotiationneeded`, which creates the offer; building a second one
+    // here raced that handler and threw InvalidAccessError ("the order of
+    // m-lines in subsequent offer doesn't match order from previous
+    // offer/answer"), leaving an uncaught rejection in the page.
+    createPeerConnection();
+    if (negotiationPendingRef.current) await negotiate();
+  }, [createPeerConnection, negotiate]);
 
   // --- signalling socket ---------------------------------------------------
   useEffect(() => {
@@ -317,24 +353,71 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
       const connection = peerRef.current ?? createPeerConnection();
 
       switch (message.type) {
-        case 'joined':
+        case 'joined': {
           setPeer(message.peers?.[0] ?? null);
           // The second arrival initiates — it is the one that knows somebody
           // is already waiting.
-          // The designated initiator is the IMPOLITE peer. Assigning the
-          // roles from the same flag that already decides who offers first
-          // keeps one source of truth for "which side yields".
-          politeRef.current = !message.should_initiate;
+          // POLITENESS IS DERIVED FROM THE USER IDS, NOT FROM should_initiate.
+          //
+          // It used to be `!message.should_initiate`, and that breaks on a
+          // reconnect. `should_initiate` means "somebody is already here", so
+          // ANY peer that reconnects mid-meeting computes it as true and
+          // becomes impolite. If both peers reconnect at some point — ordinary
+          // on a phone hotspot — both are impolite, and on an offer collision
+          // each ignores the other's offer. The call carries on, because it was
+          // negotiated at join, but every later RENEGOTIATION deadlocks.
+          //
+          // Screen sharing is renegotiation. That is this bug: the presenter
+          // sees their own screen, and the other side never receives the track.
+          //
+          // Comparing user ids is stable, needs no extra message, and both
+          // sides independently reach opposite answers — which is the whole
+          // requirement. It survives any number of reconnects.
+          const selfId = message.self?.id ?? null;
+          selfIdRef.current = selfId;
+          const otherId = message.peers?.[0]?.id ?? null;
+          hasPeerRef.current = otherId != null;
+          if (selfId != null && otherId != null) {
+            politeRef.current = selfId < otherId;
+          } else {
+            // Alone in the room, so there is nobody to collide with yet. The
+            // next `peer-joined` settles it.
+            politeRef.current = !message.should_initiate;
+          }
           if (message.should_initiate) await startCall();
           break;
+        }
 
         case 'peer-joined':
           setPeer(message.peer);
+          // Settle politeness now that there is somebody to collide with. The
+          // peer who joined computes the same comparison from their `joined`
+          // message and reaches the opposite answer.
+          if (selfIdRef.current != null && message.peer?.id != null) {
+            politeRef.current = selfIdRef.current < message.peer.id;
+          }
+          hasPeerRef.current = true;
+          // Drop the offer that was held back while the room was empty rather
+          // than sending it now. The peer who just joined is the one the
+          // server told to initiate, so its offer is already on its way, and
+          // anything we were waiting to negotiate goes out in the ANSWER we
+          // send to it — an answer carries all of our tracks.
+          //
+          // Offering here as well would be a genuine offer collision, and the
+          // polite peer resolves those by letting setRemoteDescription roll
+          // its own offer back. That is correct per the spec and fine for a
+          // later renegotiation, but on the FIRST negotiation Chrome does not
+          // restart ICE gathering after the rollback: the polite peer ends up
+          // in `stable` having never produced a single local candidate, so
+          // iceConnectionState never leaves `new` and no media flows in
+          // either direction. The call looks negotiated and stays silent.
+          negotiationPendingRef.current = false;
           break;
 
         case 'peer-left':
           setPeer(null);
           setRemoteStream(null);
+          hasPeerRef.current = false;
           break;
 
         case 'offer': {
@@ -363,16 +446,38 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
         }
 
         case 'answer':
+          // Only meaningful while we are waiting for one. An answer that
+          // arrives in any other state — a duplicate, or one for an offer we
+          // rolled back — throws InvalidStateError from
+          // setRemoteDescription, and that exception would abort this handler
+          // and leave later messages unprocessed.
+          if (connection.signalingState !== 'have-local-offer') break;
           await connection.setRemoteDescription(new RTCSessionDescription(message.payload));
           await flushPendingCandidates(connection);
           break;
 
-        case 'presentation-start':
+        case 'presentation-start': {
           // The presenter announces the stream id before the track arrives,
           // so ontrack can route it to the screen tile rather than guessing.
-          screenStreamIdRef.current = message.payload?.stream_id ?? null;
+          const screenId = message.payload?.stream_id ?? null;
+          screenStreamIdRef.current = screenId;
           setRemotePresenter(message.from ?? null);
+
+          // If the track beat the announcement, ontrack will already have
+          // filed it as the camera — which puts the shared screen in the
+          // camera tile and leaves the stage with nothing to present. Move it
+          // across rather than waiting for a track that has already arrived.
+          if (screenId) {
+            setRemoteStream((current) => {
+              if (current && current.id === screenId) {
+                setRemoteScreenStream(current);
+                return null;
+              }
+              return current;
+            });
+          }
           break;
+        }
 
         case 'presentation-stop':
           screenStreamIdRef.current = null;
@@ -427,7 +532,16 @@ export function useWebRTC({ meetingCode, localStream, enabled = true }) {
       setRemoteStream(null);
       setPeer(null);
     };
-  }, [enabled, meetingCode, localStream, createPeerConnection, startCall, flushPendingCandidates, send]);
+  }, [
+    enabled,
+    meetingCode,
+    localStream,
+    createPeerConnection,
+    startCall,
+    negotiate,
+    flushPendingCandidates,
+    send,
+  ]);
 
   const hangUp = useCallback(() => {
     send({ type: 'hangup', payload: null });

@@ -57,6 +57,13 @@ export function useInterviewMode({
   isHost = false,
   onViolation,
   maxViolations = 3,
+  // The server's verdict on this participant, from the response to the last
+  // focus event it logged. The count that decides a removal is the server's to
+  // make, so the client reports what happened and is told what follows.
+  //   'none'    outside an interview
+  //   'warned'  first departure — a way back is offered
+  //   'removed' the interview is over for them
+  verdict = 'none',
 } = {}) {
   const [acknowledged, setAcknowledged] = useState(false);
   const [isAway, setIsAway] = useState(false);
@@ -208,9 +215,24 @@ export function useInterviewMode({
     const handleFullscreenChange = () => {
       const active = Boolean(document.fullscreenElement);
       setIsFullscreen(active);
-      // Leaving fullscreen is itself an escape: it is how you get the browser
-      // chrome back, and therefore the tab bar.
-      if (!active) goAway('blur');
+
+      if (!active) {
+        // Leaving fullscreen is itself an escape: it is how you get the
+        // browser chrome back, and therefore the tab bar.
+        goAway('blur');
+        return;
+      }
+
+      // BACK IN FULLSCREEN — AND THIS CLEARS `isAway`.
+      //
+      // This was the "Return to the meeting button does nothing" bug. Leaving
+      // fullscreen set isAway, but isAway was only ever cleared by `focus` or
+      // `visibilitychange`, and exiting fullscreen fires NEITHER — the page
+      // stays focused and visible the whole time. So pressing Return
+      // re-entered fullscreen, isFullscreen became true, and isAway stayed
+      // true forever, which kept `mustBlock` true and the overlay up with no
+      // way past it.
+      comeBack();
     };
 
     // While the mode is on, block the in-app routes to another tab. This stops
@@ -265,8 +287,15 @@ export function useInterviewMode({
     lastViolation,
     exceededLimit: awayCount >= maxViolations,
     // True when the participant must be blocked: they have escaped and have
-    // not yet come back AND re-entered fullscreen.
-    mustBlock: enabled && !isHost && acknowledged && (isAway || !isFullscreen),
+    // not yet come back AND re-entered fullscreen. A removed participant is
+    // not "blocked" — their meeting is over, which MeetingRoom handles.
+    mustBlock:
+      enabled && !isHost && acknowledged && verdict !== 'removed'
+      && (isAway || !isFullscreen),
+    // Shown in the overlay, so the first departure reads as a warning with a
+    // way back and the second does not pretend to offer one.
+    verdict,
+    isFinalWarning: verdict === 'warned',
     suppressBriefly,
     reEnterFullscreen: enterEnforcement,
     // Called when the meeting ENDS, which is the only normal way out.

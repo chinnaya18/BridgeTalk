@@ -327,3 +327,102 @@ describe('buildCaptionBlocks — Bug 2: your own captions are not shown to you',
     expect(blocks[0].settledText).toBe('first second');
   });
 });
+
+describe('Bug 2 — sign captions must survive long enough to be read', () => {
+  const T = Date.parse('2026-10-21T09:25:43.000Z');
+
+  /** A segment carrying an explicit local arrival time. */
+  function arrived({ id, source = 'sign', text, at, receivedAt, speaker = 2 }) {
+    return {
+      segmentId: id, speakerId: speaker, speakerName: 'Deaf user', source, text,
+      isFinal: true, confidence: null,
+      timestamp: new Date(at).toISOString(),
+      receivedAt,
+    };
+  }
+
+  /**
+   * THE CLOCK BUG.
+   *
+   * Expiry used to be `now - serverTimestamp`. The two clocks belong to
+   * different machines. On a second device whose clock runs ahead of the
+   * server's, every caption arrives already older than its lifetime and is
+   * dropped before it is drawn — while the transcript still fills up, which is
+   * exactly how this was reported.
+   */
+  it('a caption survives a client clock running far ahead of the server', () => {
+    const serverStamp = T;            // what the server said
+    const clientNow = T + 60_000;     // this device is a minute ahead
+    const blocks = buildCaptionBlocks(
+      [arrived({ id: 's1', text: 'healthy', at: serverStamp, receivedAt: clientNow })],
+      { now: clientNow + 500 },
+    );
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].settledText).toBe('healthy');
+    expect(blocks[0].fadingOut).toBe(false);
+  });
+
+  it('a caption survives a client clock running far behind the server', () => {
+    const serverStamp = T;
+    const clientNow = T - 60_000;
+    const blocks = buildCaptionBlocks(
+      [arrived({ id: 's1', text: 'healthy', at: serverStamp, receivedAt: clientNow })],
+      { now: clientNow + 500 },
+    );
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].settledText).toBe('healthy');
+  });
+
+  it('sign blocks live markedly longer than speech blocks', () => {
+    expect(CAPTIONS.SIGN_BLOCK_TTL_MS).toBeGreaterThan(CAPTIONS.BLOCK_TTL_MS);
+
+    const justPastSpeechTtl = CAPTIONS.BLOCK_TTL_MS + 1000;
+
+    const sign = buildCaptionBlocks(
+      [arrived({ id: 'sg', source: 'sign', text: 'healthy', at: T, receivedAt: T })],
+      { now: T + justPastSpeechTtl },
+    );
+    const speech = buildCaptionBlocks(
+      [arrived({ id: 'sp', source: 'speech', text: 'hello', at: T, receivedAt: T })],
+      { now: T + justPastSpeechTtl },
+    );
+
+    expect(sign, 'a sign block must still be on screen here').toHaveLength(1);
+    expect(sign[0].fadingOut).toBe(false);
+    // Speech is past its life — fading or already gone, either is correct.
+    expect(speech.length === 0 || speech[0].fadingOut).toBe(true);
+  });
+
+  it('a sign block does eventually go, so the rail does not accumulate', () => {
+    const blocks = buildCaptionBlocks(
+      [arrived({ id: 'sg', text: 'healthy', at: T, receivedAt: T })],
+      { now: T + CAPTIONS.SIGN_BLOCK_TTL_MS + CAPTIONS.BLOCK_FADE_MS + 100 },
+    );
+    expect(blocks).toEqual([]);
+  });
+
+  it('falls back to the server timestamp when no arrival time is recorded', () => {
+    // Defensive: an entry written before this field existed.
+    const blocks = buildCaptionBlocks(
+      [{ segmentId: 'x', speakerId: 2, speakerName: 'D', source: 'sign',
+         text: 'healthy', isFinal: true, timestamp: new Date(T).toISOString() }],
+      { now: T + 1000 },
+    );
+    expect(blocks).toHaveLength(1);
+  });
+
+  it("the real session's three signs stay on screen together", () => {
+    // healthy / bank / healthy at 09:25:43, :48, :51 — the actual sequence.
+    const blocks = buildCaptionBlocks(
+      [
+        arrived({ id: 'a', text: 'healthy', at: T,          receivedAt: T }),
+        arrived({ id: 'b', text: 'bank',    at: T + 5000,   receivedAt: T + 5000 }),
+        arrived({ id: 'c', text: 'healthy', at: T + 8000,   receivedAt: T + 8000 }),
+      ],
+      { now: T + 12000 },
+    );
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].settledText).toBe('healthy bank healthy');
+    expect(blocks[0].fadingOut).toBe(false);
+  });
+});

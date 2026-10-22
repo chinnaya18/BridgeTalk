@@ -123,6 +123,11 @@ export default function MeetingRoom() {
   // Host-only: nobody else is sent these.
   const [violations, setViolations] = useState({});
 
+  // The server's verdict on THIS participant under the Interview Mode rule.
+  // 'none' until they leave the meeting screen, then 'warned', then removal.
+  const [interviewVerdict, setInterviewVerdict] = useState('none');
+  const [removedFromInterview, setRemovedFromInterview] = useState(false);
+
   const [openPanel, setOpenPanel] = useState(null); // null | details | people | transcript
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -368,8 +373,17 @@ export default function MeetingRoom() {
       });
 
       if (isDeparture) {
-        toastRef.current?.show(`${event.user_name} left the meeting screen`, {
-          icon: 'warning',
+        // The server decides; the host is told what it decided rather than
+        // being left to count departures themselves.
+        const message =
+          event.action === 'removed'
+            ? `${event.user_name} was removed from the interview — left the meeting screen ${event.departures} times`
+            : event.action === 'warned'
+              ? `${event.user_name} left the meeting screen — warned`
+              : `${event.user_name} left the meeting screen`;
+        toastRef.current?.show(message, {
+          icon: event.action === 'removed' ? 'person_remove' : 'warning',
+          durationMs: event.action === 'removed' ? 8000 : 4000,
         });
       } else if (event.duration_away_ms != null) {
         toastRef.current?.show(
@@ -699,18 +713,33 @@ export default function MeetingRoom() {
   const isHost = Boolean(meeting?.host?.id && user?.id && meeting.host.id === user.id);
   const interviewOn = Boolean(meeting?.is_interview_mode);
 
+  /**
+   * Report leaving the meeting screen, and act on what the server says.
+   *
+   * The server owns the count. It replies with a verdict — `warned` on a first
+   * departure, `removed` on the one that ends the interview — because that
+   * decision must not be a browser's to make: a client that could decline to
+   * count its own departures could sit outside the meeting indefinitely.
+   */
   const handleViolation = useCallback(
     ({ type, durationMs }) => {
       if (!interviewOn) return;
-      meetingsApi.logFocusEvent(code, type, durationMs).catch(() => {
-        // Best effort. A failed log must never interrupt the meeting itself.
-      });
+      meetingsApi
+        .logFocusEvent(code, type, durationMs)
+        .then((event) => {
+          if (event?.action === 'removed') setRemovedFromInterview(true);
+          else if (event?.action === 'warned') setInterviewVerdict('warned');
+        })
+        .catch(() => {
+          // Best effort. A failed log must never interrupt the meeting itself.
+        });
     },
     [code, interviewOn],
   );
 
   const interview = useInterviewMode({
     enabled: interviewOn,
+    verdict: removedFromInterview ? 'removed' : interviewVerdict,
     isHost,
     onViolation: handleViolation,
     maxViolations: MAX_VIOLATIONS,
@@ -734,6 +763,51 @@ export default function MeetingRoom() {
       toast.show(cause?.message ?? 'Could not start interview mode', { icon: 'error' });
     }
   }, [code, interviewOn, isHost, toast]);
+
+  /**
+   * Removed from the interview. Their meeting is over.
+   *
+   * The teardown has to be as complete as the one for a meeting ending: the
+   * keyboard lock released and fullscreen left, or they are stranded in a
+   * locked page with browser shortcuts still captured and no meeting behind
+   * it. Rejoining is refused by the server, so the ended page is the end of it.
+   */
+  useEffect(() => {
+    if (!removedFromInterview) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        await interview.releaseEnforcement?.();
+      } catch {
+        // Nothing to release, or the browser refused. Leaving anyway.
+      }
+      hangUp();
+      try {
+        await meetingsApi.leave(code);
+      } catch {
+        // Already marked removed server-side; leaving is a courtesy.
+      }
+      if (!cancelled) {
+        navigate(`/ended/${code}`, {
+          replace: true,
+          state: {
+            removed: true,
+            reason:
+              'You were removed from this interview for leaving the meeting '
+              + 'screen more than once.',
+          },
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // `interview` changes identity on every violation; re-running would
+    // navigate twice.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [removedFromInterview, code, hangUp, navigate]);
 
   /**
    * The meeting ended, announced by the server.
@@ -960,6 +1034,7 @@ export default function MeetingRoom() {
           awayCount={interview.awayCount}
           maxViolations={MAX_VIOLATIONS}
           isFullscreen={interview.isFullscreen}
+          isFinalWarning={interview.isFinalWarning}
           onReturn={interview.reEnterFullscreen}
         />
       ) : null}

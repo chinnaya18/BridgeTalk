@@ -2,6 +2,7 @@
 
 import logging
 import secrets
+from uuid import uuid4
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -11,7 +12,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.deps import CurrentUser, DbSession
 from app.models.meeting import FocusEvent, FocusEventType, Meeting, MeetingParticipant
-from app.models.transcript import Transcript
+from app.models.transcript import Transcript, TranscriptSource
 from app.models.user import User
 from app.schemas.focus import (
     FocusEventCreate,
@@ -101,6 +102,67 @@ def _detail_with_count(db: Session, meeting: Meeting) -> MeetingDetail:
     return MeetingDetail.model_validate(meeting).model_copy(
         update={"participant_count": _participant_count(db, meeting.id)}
     )
+
+
+# Leaving the meeting screen this many times ends a participant's interview.
+# The FIRST departure is a warning; the second removes them.
+INTERVIEW_MAX_DEPARTURES = 2
+
+# Departures shorter than this are not counted. A notification stealing focus
+# for a moment is not the same as leaving, and counting it would remove people
+# for things they did not do.
+INTERVIEW_MIN_DEPARTURE_MS = 400
+
+
+def _system_line(db: Session, *, meeting_id: int, user_id: int, text_: str) -> None:
+    """Write a `system` line into the meeting transcript.
+
+    Interview Mode warnings and removals belong in the transcript so it is an
+    account of what HAPPENED, not only of what was said. The text is composed
+    here, on the server — a client could otherwise write whatever it liked into
+    the permanent record of someone else's interview.
+
+    A `segment_id` is generated so the row is covered by the same
+    UNIQUE (meeting_id, segment_id) index as every other line, which keeps a
+    retry idempotent.
+    """
+    row = Transcript(
+        meeting_id=meeting_id,
+        user_id=user_id,
+        segment_id=f"sys-{uuid4().hex[:20]}",
+        source=TranscriptSource.SYSTEM,
+        content=text_,
+        confidence=None,
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    db.add(row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+
+
+def _count_departures(db: Session, meeting: Meeting, user_id: int) -> int:
+    """How many times this participant has left the meeting screen.
+
+    Counted on the SERVER from focus_events rather than trusted from the
+    client: the number decides whether somebody is removed from an interview,
+    and a browser must not be able to talk itself out of that.
+
+    Only events after `interview_mode_started_at` count — tab switching before
+    the mode was switched on was allowed. Only `blur` and `hidden` count; a
+    `return` is the recovery, not another offence.
+    """
+    statement = select(func.count(FocusEvent.id)).where(
+        FocusEvent.meeting_id == meeting.id,
+        FocusEvent.user_id == user_id,
+        FocusEvent.event_type.in_([FocusEventType.BLUR, FocusEventType.HIDDEN]),
+    )
+    if meeting.interview_mode_started_at is not None:
+        statement = statement.where(
+            FocusEvent.created_at >= meeting.interview_mode_started_at
+        )
+    return int(db.scalar(statement) or 0)
 
 
 async def _announce_to_room(code: str, message: dict) -> int:
@@ -402,6 +464,19 @@ def join_meeting(code: str, db: DbSession, current_user: CurrentUser) -> Meeting
         )
     )
 
+    # Removed from an interview, and removal is final. Checked HERE rather than
+    # only in the client, because the client of somebody who has just been
+    # removed is exactly the client least worth trusting — reloading the page
+    # or re-pasting the link must not get them back in.
+    if existing is not None and existing.removed_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "You were removed from this interview for leaving the meeting "
+                "screen more than once. Only the host can readmit you."
+            ),
+        )
+
     if existing is None:
         db.add(
             MeetingParticipant(
@@ -616,6 +691,73 @@ async def log_focus_event(
         created_at=event.created_at,
     )
 
+    # --- the Interview Mode rule ------------------------------------------
+    #
+    # Decided HERE, on the server, from rows the server wrote. The number
+    # decides whether somebody is removed from an interview, so a browser must
+    # not be able to talk itself out of it — or into removing someone else.
+    #
+    # A `return` event is the recovery and is never an offence, so only
+    # departures are judged.
+    action = "none"
+    departures = 0
+
+    is_departure = payload.event_type in (FocusEventType.BLUR, FocusEventType.HIDDEN)
+    too_brief = (
+        payload.duration_away_ms is not None
+        and payload.duration_away_ms < INTERVIEW_MIN_DEPARTURE_MS
+    )
+
+    if meeting.is_interview_mode and is_departure and current_user.id != meeting.host_id:
+        departures = _count_departures(db, meeting, current_user.id)
+
+        if departures >= INTERVIEW_MAX_DEPARTURES:
+            action = "removed"
+            # Mark them removed BEFORE announcing, so a rejoin racing the
+            # broadcast is already refused.
+            participant = db.scalar(
+                select(MeetingParticipant).where(
+                    MeetingParticipant.meeting_id == meeting.id,
+                    MeetingParticipant.user_id == current_user.id,
+                )
+            )
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if participant is not None:
+                participant.removed_at = now
+                participant.left_at = participant.left_at or now
+                db.commit()
+
+            _system_line(
+                db,
+                meeting_id=meeting.id,
+                user_id=current_user.id,
+                text_=(
+                    f"{current_user.name} left the meeting screen "
+                    f"{departures} times and was removed from the interview."
+                ),
+            )
+            await _announce_to_room(
+                meeting.code,
+                {
+                    "type": "participant-removed",
+                    "meeting_code": meeting.code,
+                    "user": {"id": current_user.id, "name": current_user.name},
+                    "departures": departures,
+                    "reason": "left the meeting screen more than once",
+                },
+            )
+        else:
+            action = "warned"
+            _system_line(
+                db,
+                meeting_id=meeting.id,
+                user_id=current_user.id,
+                text_=(
+                    f"{current_user.name} left the meeting screen. "
+                    f"Warned: leaving again will remove them from the interview."
+                ),
+            )
+
     # Tell the HOST, in real time, and only the host.
     #
     # A violation is a record *about* a participant, so broadcasting it to the
@@ -635,6 +777,10 @@ async def log_focus_event(
                         "type": "focus-event",
                         "meeting_code": meeting.code,
                         "event": public.model_dump(mode="json"),
+                        # So the host's toast can say "warned" or "removed"
+                        # rather than leaving them to count departures.
+                        "action": action,
+                        "departures": departures,
                     },
                 )
             except Exception:  # noqa: BLE001
@@ -642,7 +788,9 @@ async def log_focus_event(
                 # log; a failed notification must not fail the request.
                 logger.exception("Could not notify host of a focus event")
 
-    return public
+    # The participant's own client acts on this: `warned` shows the warning
+    # overlay with a way back, `removed` ends their meeting.
+    return public.model_copy(update={"action": action, "departures": departures})
 
 
 @router.get(

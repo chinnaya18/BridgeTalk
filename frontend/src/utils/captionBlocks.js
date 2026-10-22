@@ -78,7 +78,11 @@ export function buildCaptionBlocks(
   const blocks = [];
 
   for (const caption of usable) {
+    // ORDER comes from the server's clock, which is the right one for sorting
+    // across two devices. AGE comes from this browser's clock, because the
+    // server's is not comparable with `now` — see useCaptionStore.
     const at = toEpoch(caption.timestamp, now);
+    const arrived = typeof caption.receivedAt === 'number' ? caption.receivedAt : at;
     const current = blocks[blocks.length - 1];
 
     // A new block starts when a DIFFERENT person speaks, or when this speaker
@@ -90,6 +94,7 @@ export function buildCaptionBlocks(
     if (sameSpeaker && withinWindow) {
       current.segments.push(caption);
       current.lastUpdate = Math.max(current.lastUpdate, at);
+      current.lastArrival = Math.max(current.lastArrival, arrived);
     } else {
       blocks.push({
         key: `${caption.speakerId ?? 'anon'}-${caption.segmentId}`,
@@ -97,6 +102,7 @@ export function buildCaptionBlocks(
         speakerName: caption.speakerName,
         segments: [caption],
         lastUpdate: at,
+        lastArrival: arrived,
       });
     }
   }
@@ -109,7 +115,19 @@ export function buildCaptionBlocks(
     const openTail = last.isFinal ? null : last;
     const settled = openTail ? block.segments.slice(0, -1) : block.segments;
 
-    const ageMs = Math.max(0, now - block.lastUpdate);
+    // Measured from ARRIVAL, on this browser's clock.
+    const ageMs = Math.max(0, now - block.lastArrival);
+
+    // Sign blocks live longer than speech, and the reason is about the viewer
+    // rather than the technology.
+    //
+    // Speech captions stream continuously, so the block keeps refreshing while
+    // somebody talks. A sign caption is committed once per movement — one word
+    // every few seconds — and the hearing participant is WATCHING THE SIGNER,
+    // not the caption rail. By the time they look down, a five-second block
+    // has already gone, and the words survive only in the transcript. That is
+    // precisely the reported bug.
+    const ttlForBlock = last.source === 'sign' ? CAPTIONS.SIGN_BLOCK_TTL_MS : ttlMs;
 
     return {
       key: block.key,
@@ -126,14 +144,17 @@ export function buildCaptionBlocks(
       // Past its time to live: the UI starts the fade. It is kept in the list
       // for BLOCK_FADE_MS so the fade can be seen rather than the block
       // vanishing between two renders.
-      fadingOut: ageMs > ttlMs,
+      fadingOut: ageMs > ttlForBlock,
+      ttlMs: ttlForBlock,
       segmentIds: block.segments.map((segment) => segment.segmentId),
     };
   });
 
   // Drop blocks that have finished fading. Doing it here rather than in the
   // component keeps "what is on screen" a function of (captions, now).
-  const alive = shaped.filter((block) => block.ageMs <= ttlMs + CAPTIONS.BLOCK_FADE_MS);
+  const alive = shaped.filter(
+    (block) => block.ageMs <= block.ttlMs + CAPTIONS.BLOCK_FADE_MS,
+  );
 
   // Newest blocks win when there are too many; the oldest is dropped first.
   return alive.slice(-maxBlocks);

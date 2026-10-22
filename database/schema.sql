@@ -111,6 +111,10 @@ CREATE TABLE IF NOT EXISTS meeting_participants (
   user_id    INT      NOT NULL,
   joined_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   left_at    DATETIME NULL,
+  -- Set when the host's Interview Mode rules remove somebody. Distinct from
+  -- `left_at`, which merely means "not here now": a removed participant may
+  -- NOT rejoin, and the join endpoint refuses them while this is set.
+  removed_at DATETIME NULL,
 
   KEY ix_participants_meeting (meeting_id),
   KEY ix_participants_user (user_id),
@@ -146,7 +150,10 @@ CREATE TABLE IF NOT EXISTS transcripts (
   -- Which of the two translation directions produced this line. Keeping them
   -- distinguishable is what lets the transcript panel label speakers, and
   -- what allows sign accuracy to be reported separately from speech accuracy.
-  source     ENUM('sign','speech') NOT NULL,
+  -- 'system' is not a translation direction: it is the meeting recording
+  -- itself. Interview Mode warnings and removals are written as system lines
+  -- so the transcript accounts for what HAPPENED, not only what was said.
+  source     ENUM('sign','speech','system') NOT NULL,
   content    TEXT  NOT NULL,
   -- NULL for speech lines. The Web Speech API reports a confidence value, but
   -- it is not comparable to our model's softmax probability, so averaging the

@@ -228,6 +228,7 @@ globalThis.WebSocket = FakeWebSocket;
 // --- RTCPeerConnection ----------------------------------------------------
 class FakeRTCPeerConnection {
   constructor() {
+    FakeRTCPeerConnection.instances.push(this);
     this.localDescription = null;
     this.remoteDescription = null;
     this.signalingState = 'stable';
@@ -277,6 +278,10 @@ class FakeRTCPeerConnection {
     this.connectionState = 'closed';
   }
 }
+// Recorded so a test can reach the connection the hook built and fire the
+// events jsdom never will — `onnegotiationneeded` above all, which is what
+// decides whether an offer is sent.
+FakeRTCPeerConnection.instances = [];
 globalThis.RTCPeerConnection = FakeRTCPeerConnection;
 globalThis.RTCSessionDescription = function RTCSessionDescription(init) {
   return { ...init };
@@ -330,6 +335,7 @@ const realConsoleError = console.error;
 beforeEach(() => {
   consoleErrors = [];
   FakeWebSocket.instances = [];
+  FakeRTCPeerConnection.instances = [];
   localStorage.clear();
   sessionStorage.clear();
 
@@ -363,4 +369,10 @@ afterEach(() => {
   expect(fatal, `console.error reported a render failure:\n${fatal.join('\n---\n')}`).toEqual([]);
 });
 
-export { FakeMediaStream, FakeMediaStreamTrack, FakeWebSocket, fakeStream };
+export {
+  FakeMediaStream,
+  FakeMediaStreamTrack,
+  FakeRTCPeerConnection,
+  FakeWebSocket,
+  fakeStream,
+};

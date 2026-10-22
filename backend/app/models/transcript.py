@@ -30,10 +30,17 @@ class TranscriptSource(str, enum.Enum):
     Keeping the two directions distinguishable is what lets the transcript
     panel label speakers correctly, and what makes it possible to report sign
     recognition accuracy separately from speech recognition accuracy.
+
+    SYSTEM is not a translation direction. It is the meeting recording itself:
+    Interview Mode warnings and removals are written here so the transcript is
+    a complete account of what happened, not just of what was said. They are
+    attributed to the participant they concern, and the content is written by
+    the server — never by a client.
     """
 
     SIGN = "sign"
     SPEECH = "speech"
+    SYSTEM = "system"
 
 
 class Transcript(Base):

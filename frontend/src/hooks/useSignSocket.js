@@ -132,7 +132,26 @@ export function useSignSocket({
           // Only the host receives these — the server targets their socket
           // rather than broadcasting, because a violation is a record about a
           // participant and the room must not see each other's.
-          onFocusEventRef.current?.(message.event);
+          //
+          // `action` ("warned"/"removed") and `departures` arrive BESIDE
+          // `event`, not inside it, so they are folded in here. Passing
+          // `message.event` alone left the host's toast reading
+          // `event.action === undefined` every time, so a removal was
+          // announced with the same bland "left the meeting screen" line as a
+          // first warning and the host was never actually told what the
+          // server had decided.
+          onFocusEventRef.current?.({
+            ...message.event,
+            action: message.action ?? message.event?.action ?? 'none',
+            departures: message.departures ?? message.event?.departures ?? 0,
+          });
+          break;
+
+        case 'participant-removed':
+          // Broadcast to the room when Interview Mode removes somebody. The
+          // participant it names ends their own meeting; everyone else just
+          // learns why a tile disappeared.
+          onRoomStateRef.current?.({ removed: message.user ?? null });
           break;
 
         case 'meeting-ended':

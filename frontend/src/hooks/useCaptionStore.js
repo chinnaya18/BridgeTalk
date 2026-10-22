@@ -45,6 +45,18 @@ export function useCaptionStore() {
       isFinal: Boolean(event.is_final),
       confidence: event.confidence ?? null,
       timestamp: event.timestamp ?? new Date().toISOString(),
+      // When THIS browser received it, on THIS browser's clock.
+      //
+      // Expiry used to be measured from `timestamp`, which the SERVER stamps.
+      // The two clocks are unrelated: on a second device whose clock runs
+      // ahead of the server's by more than the block lifetime, every caption
+      // arrives already "expired" and is dropped before it is ever drawn.
+      // Nothing in the UI explains that, and the transcript still fills up —
+      // which is exactly the reported symptom.
+      //
+      // The server timestamp is still used for ORDER and for display, where it
+      // is the right clock to trust. Only the age is local.
+      receivedAt: Date.now(),
     };
 
     bySegment.current.set(segmentId, entry);

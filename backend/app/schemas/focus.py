@@ -37,6 +37,13 @@ class FocusEventPublic(BaseModel):
     duration_away_ms: Optional[int] = None
     created_at: datetime
 
+    # What the server decided about this event, under the Interview Mode rule.
+    # "none" outside an interview, "warned" on a first departure, "removed" on
+    # the one that ends it. The client acts on this rather than counting for
+    # itself — the count decides a removal, so it is the server's to make.
+    action: str = "none"
+    departures: int = 0
+
 
 class ParticipantViolations(BaseModel):
     """One participant's violation record, which is what the host acts on.

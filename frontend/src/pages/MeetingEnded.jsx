@@ -24,6 +24,11 @@ export default function MeetingEnded() {
   const location = useLocation();
 
   const hintedEndedByHost = Boolean(location.state?.endedByHost);
+  // Removal is not the same as leaving, and the page must not offer Rejoin for
+  // it — the server refuses, so a button that looked available would simply
+  // fail.
+  const wasRemoved = Boolean(location.state?.removed);
+  const removalReason = location.state?.reason ?? null;
 
   const [meeting, setMeeting] = useState(null);
   const [checking, setChecking] = useState(true);
@@ -51,7 +56,8 @@ export default function MeetingEnded() {
   }, [code]);
 
   const isOver = hintedEndedByHost || (meeting ? !meeting.is_active : false);
-  const canRejoin = !checking && meeting?.is_active === true;
+  // A removed participant may not rejoin, whatever the meeting's state.
+  const canRejoin = !wasRemoved && !checking && meeting?.is_active === true;
 
   return (
     <main className="grid min-h-screen place-items-center bg-light-bg p-6">
@@ -61,8 +67,26 @@ export default function MeetingEnded() {
         </div>
 
         <h1 className="text-2xl font-normal text-light-text">
-          {isOver ? 'The meeting has ended' : 'You left the meeting'}
+          {wasRemoved
+            ? 'You were removed from this interview'
+            : isOver
+              ? 'The meeting has ended'
+              : 'You left the meeting'}
         </h1>
+
+        {wasRemoved ? (
+          <p
+            role="alert"
+            className="mx-auto mt-3 max-w-sm rounded-card border border-light-danger/30
+                       bg-light-danger/[.06] p-3 text-sm text-light-text"
+          >
+            {removalReason
+              ?? 'You were removed for leaving the meeting screen more than once.'}
+            {' '}
+            This was recorded in the meeting transcript. Only the host can
+            readmit you.
+          </p>
+        ) : null}
 
         {meeting ? (
           <p className="mt-2 text-sm text-light-muted">

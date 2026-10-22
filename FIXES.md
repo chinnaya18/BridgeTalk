@@ -876,6 +876,320 @@ the config both ways.
 
 ---
 
+# Round 2 — screen share, sign captions, interview mode
+
+Baseline for this round: `2011645`. Suites before any round-2 change:
+**284 backend passed / 2 skipped · 83 frontend · 0 lint errors · build OK.**
+
+---
+
+## Fix 7 — Bug 1: a shared screen never reached the other participant
+
+### What was reported
+
+> when I give present share the screen is not shared to the other user while
+> i shows like sharing to the person who's sharing the screen
+
+### Root cause — and it was much worse than the report
+
+Instrumenting `RTCPeerConnection` in both browsers showed that **no media was
+flowing at all**, in either direction, before anybody pressed Present. Both
+peers sat in `signalingState: have-local-offer`, `connectionState: new`, with
+`framesDecoded: 0`:
+
+```
+=== HOST ===                          === GUEST ===
+ >> setLocalDescription  state=stable  >> setLocalDescription  state=stable
+    ok -> have-local-offer                ok -> have-local-offer
+ STATE have-local-offer / new          STATE have-local-offer / new
+ RECV joined | SEND offer              RECV joined | SEND offer
+                                       RECV no-peers x5
+                                       RECV offer     <-- ignored
+```
+
+The chain:
+
+1. `createPeerConnection()` adds the local camera and microphone tracks, which
+   fires `onnegotiationneeded` immediately.
+2. The **first** peer into the meeting therefore offered into an **empty
+   room**. The server has nobody to relay it to, so it replies `no-peers` —
+   but the client had already moved to `have-local-offer`, and stayed there.
+3. The second peer joined, was told `should_initiate: true`, and offered
+   properly.
+4. That real offer reached the first peer, which still held its stale local
+   offer. To the perfect-negotiation check this is an offer collision. The
+   impolite peer ignores a colliding offer — so **nobody answered**, and the
+   call never connected.
+
+A separate defect in the same path: `startCall()` built an offer explicitly
+with `createOffer()` + `setLocalDescription(offer)` while `onnegotiationneeded`
+was building one too. The two raced, and the loser threw an uncaught
+
+```
+InvalidAccessError: Failed to set local offer sdp: The order of m-lines in
+subsequent offer doesn't match order from previous offer/answer.
+```
+
+### Why the previous round's politeness change exposed it
+
+Round 1 replaced `polite = !should_initiate` with `polite = selfId < otherId`,
+because `should_initiate` is recomputed on every reconnect and so was not
+stable. That reasoning still holds and the rule is unchanged.
+
+But the old rule happened to make the *waiting* peer — the one holding the
+stale offer — always polite, so it rolled back and accepted. That **masked**
+this bug. Deriving politeness from ids removed the accident, and the latent
+defect became a hard deadlock. The honest summary is that the old rule was
+wrong in a way that hid a worse bug.
+
+### Why "let the polite peer absorb it" is not the fix
+
+Tried and measured. On a **first** negotiation Chrome does not restart ICE
+gathering after the implicit rollback: the polite peer reaches `stable` having
+never emitted a single local candidate, so `iceConnectionState` never leaves
+`new` and the call is equally silent.
+
+```
+=== HOST (polite, rolled back) ===     === GUEST ===
+  pc0 sig->stable                        pc0 gather host x4
+  pc0 addCand x5                         pc0 gather srflx
+  (never gathered a candidate)           (never added one)
+  final: pc0:stable/new                  final: pc0:stable/new
+```
+
+A bare two-peer `RTCPeerConnection` loopback in the same browser connects and
+moves 8830 bytes, so this is the application's behaviour, not the environment.
+
+**The collision has to be avoided, not resolved.**
+
+### The fix — `frontend/src/hooks/useWebRTC.js`
+
+1. A new `negotiate()` refuses to offer while the room is empty and records
+   that an offer is owed:
+
+   ```js
+   if (!hasPeerRef.current) { negotiationPendingRef.current = true; return; }
+   ```
+
+2. `onnegotiationneeded` is now the only place that offers, so the race that
+   threw `InvalidAccessError` is gone. `startCall()` just makes sure the
+   connection exists.
+
+3. On `peer-joined` the deferred offer is **dropped, not sent**: the peer who
+   just arrived is the one the server told to initiate, and anything we were
+   waiting to negotiate goes out in the **answer** we send it — an answer
+   carries all of our tracks.
+
+4. `hasPeerRef` is maintained from `joined`, `peer-joined` and `peer-left`.
+
+Also kept from the first pass at this bug: `useScreenShare` announces
+`presentation-start` *before* adding the track, so the receiver can route the
+stream by id instead of guessing, and reports a missing peer connection
+instead of showing the presenter their own screen in silence.
+
+### Verified
+
+```
+peer connection reaches "connected" on both sides      ok
+host decodes the guest's camera video                  ok
+guest decodes the host's camera video                  ok
+host sees that they are presenting                     ok
+guest is told the host is presenting                   ok
+guest now receives TWO video streams (camera + screen) ok
+guest is decoding frames from both                     ok
+   guest inbound video streams, frames decoded: [554,197]
+```
+
+### Tests added
+
+`frontend/src/test/webrtcNegotiation.test.js` — 4 tests, which mount the hook
+and fire the `onnegotiationneeded` that jsdom never fires:
+
+- no offer while the room is empty
+- still no offer when the peer arrives — the arriver initiates
+- exactly one offer when joining second
+- a screen share still renegotiates once the peer is present
+
+Confirmed to **fail** with the gate removed (first two tests) and pass with it.
+
+`src/test/setup.js` gained `FakeRTCPeerConnection.instances`, reset per test,
+so a test can reach the connection the hook built.
+
+---
+
+## Fix 8 — Bug 2: sign captions never showed on the hearing user's screen
+
+### What was reported
+
+> the sign language captions are not displayed in the hearing user screen but
+> it is visible in the transcript. but if any voice from the deaf user is
+> detected it's captions are displayed in the hearing user's screen but the
+> sign language captions.
+
+### Root cause
+
+Caption blocks were aged against the **producer's** `timestamp`, which is the
+sender's `Date.now()`. Two devices do not share a clock. When the signer's
+machine ran even a few seconds behind the viewer's, a sign caption arrived
+already older than its TTL and was filtered out before it could be painted.
+
+Speech captions survived because they are produced continuously, so a fresh
+one always replaced the expired one before anybody noticed. A sign caption is
+a single discrete utterance — there is no follow-up to cover for it.
+
+The transcript was never affected: it is written server-side and read back by
+`created_at`, so the caption was always in the record. That is exactly the
+asymmetry in the report.
+
+### The fix
+
+- `frontend/src/hooks/useCaptionStore.js` — stamps `receivedAt: Date.now()` on
+  arrival, from the **viewer's** clock.
+- `frontend/src/utils/captionBlocks.js` — ages blocks from local arrival, not
+  from the sender's timestamp.
+- `frontend/src/config/recognition.js` — `SIGN_BLOCK_TTL_MS: 20000`, so a
+  signed sentence stays readable long enough to be read. Signing a sentence
+  takes longer than saying it.
+
+### Verified
+
+```
+sign caption appears on the hearing user's screen      ok
+sign caption is still readable 11s later               ok   (it vanished at 5s before)
+```
+
+### Tests
+
+`frontend/src/test/captionBlocks.test.js` — now 28 tests, including clock-skew
+cases where the producer's clock is behind and ahead of the viewer's.
+
+---
+
+## Fix 9 — Bug 3: the interview-mode flow
+
+### What was reported
+
+> once the user clicks interview mode then the other user is put in full screen
+> mode. Once that user goes out of the meeting he's taken out of the meeting,
+> and the return to meeting option is shown but once that is clicked he's not
+> taken back to the meeting.
+
+and the flow that was asked for: one warning, then removal, the host notified
+each time, and all of it in the transcript.
+
+### Root cause 1 — "Return to the meeting" did nothing
+
+Leaving fullscreen set `isAway`, but `isAway` was only ever cleared by a
+`focus` or `visibilitychange` event — and **exiting fullscreen fires
+neither**. The page stays focused and visible throughout. So pressing Return
+re-entered fullscreen, `isFullscreen` became true, `isAway` stayed true
+forever, `mustBlock` stayed true, and the overlay could not be dismissed.
+
+Fixed in `useInterviewMode.js`: `handleFullscreenChange` now calls
+`comeBack()` when fullscreen becomes active again.
+
+### Root cause 2 — the host was never told what the server decided
+
+The server sends its verdict **beside** the event, not inside it:
+
+```json
+{ "type": "focus-event", "event": {...}, "action": "removed", "departures": 2 }
+```
+
+`useSignSocket` passed `message.event` on by itself, so the host's toast read
+`event.action === undefined` every time and fell through to its bland
+"left the meeting screen" wording. A removal was announced in exactly the same
+words as a first warning. Fixed by folding `action` and `departures` into the
+object handed to the handler.
+
+### The rule, decided server-side
+
+`backend/app/api/meetings.py` — the count that removes somebody is the
+server's, from rows the server wrote, so a browser cannot talk itself out of it
+or into removing someone else:
+
+- `INTERVIEW_MAX_DEPARTURES = 2`
+- first departure → `action: "warned"` + a `system` transcript line
+- second → `participant.removed_at` stamped **before** the broadcast, so a
+  rejoin racing the announcement is already refused, a `system` transcript
+  line, and a `participant-removed` broadcast
+- `join_meeting` now returns 403 when `removed_at is not None`
+
+Supporting changes: `TranscriptSource.SYSTEM`, `MeetingParticipant.removed_at`,
+`database/migrations/004_interview_removal.sql` (applied and verified),
+`FocusEventPublic.action` / `.departures`, and on the client the final-warning
+wording, the removal redirect, and `MeetingEnded` withholding Rejoin.
+
+### Verified
+
+```
+guest gets the full-screen disclaimer                  ok
+guest is put into full screen                          ok
+departure 1: host is told it was a WARNING             ok
+departure 1: guest is told it is their only warning    ok
+Return puts them back in the meeting                   ok
+departure 2: host is told it was a REMOVAL             ok
+departure 2: guest is taken out of the meeting         ok
+departure 2: Rejoin is withheld                        ok
+removed participant cannot rejoin                      ok
+```
+
+Transcript, read straight out of MySQL:
+
+```
+SJH-F2S | system | Demo Hearing User left the meeting screen. Warned:
+                   leaving again will remove them from the interview.
+SJH-F2S | system | Demo Hearing User left the meeting screen 2 times and was
+                   removed from the interview.
+```
+
+`meeting_participants.removed_at = 2026-10-22 14:47:05` for that user.
+
+### Tests added
+
+`frontend/src/test/focusEventRelay.test.js` — 3 tests on the verdict relay
+(`removed`, `warned`, and defaulting to `none` for a `return`). Confirmed to
+fail against the old one-line handler.
+
+`backend/tests/test_focus_events.py` — now 30 tests, covering the warn/remove
+boundary, the system transcript lines, and the rejoin refusal.
+
+---
+
+## A note on how these were verified
+
+An earlier run of this round reported four failures that were **not** real:
+the script drove departures with `window.dispatchEvent(new Event('blur'))`, a
+synthetic event that never fires `fullscreenchange` and so never exercised the
+handler the bug lived in. Driving the genuine path — `document.exitFullscreen()`,
+and a real click for the gesture that re-enters it — showed the flow working.
+
+Two further "failures" were the harness as well: a wrong transcript URL
+(`/api/meetings/{code}/transcript`; the route is `/api/transcripts/{id}`) and a
+`MutationObserver` that missed toasts.
+
+Every claim above is from a run against the app on
+`https://192.168.200.195:5173` with two browser contexts.
+
+---
+
+# Round 2 — suite results
+
+| Suite | Baseline (`2011645`) | After round 2 |
+|---|---|---|
+| Backend `pytest` | 284 passed, 2 skipped | **284 passed, 2 skipped** |
+| Frontend `npm run lint` | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend `npm test` | 83 passed | **90 passed** |
+| Frontend `npx vite build` | succeeded | **succeeded** |
+| Two-browser end-to-end | 10 of 14 checks | **19 of 19 checks** |
+
+**Nothing that passed in the baseline fails.** New tests this round: **+7
+frontend** (4 negotiation, 3 verdict relay). The backend count is unchanged
+because the interview-mode rule's tests landed in the baseline commit.
+
+
+---
+
 # Manual test script — two devices
 
 Everything below needs a camera, a voice, or two devices. **None of it has been
@@ -983,6 +1297,42 @@ Automated equivalent, which **has** been run:
 ```bash
 cd frontend && npm run compare:profiles:offline
 ```
+
+---
+
+## B6 — the call itself, and the screen share (round 2)
+
+| # | Do this | Expect |
+|---|---|---|
+| **B6-1** | Join from both devices and wait ~10 s | **Each of you can see the other's camera**, not a frozen tile |
+| **B6-2** | On device A press **Present** and pick a window | A shows "You are presenting" |
+| **B6-3** | Look at **device B** | B shows "A is presenting" **and the shared window itself**, moving |
+| **B6-4** | Move a window around on A | B's view updates |
+| **B6-5** | Press **Stop presenting** on A | B returns to A's camera; the call stays up |
+
+## B7 — sign captions reach the hearing user (round 2)
+
+| # | Do this | Expect |
+|---|---|---|
+| **B7-1** | On the deaf user's device, sign so a caption is produced | The caption appears on the **hearing user's** screen |
+| **B7-2** | Wait ~15 s without signing | It is **still readable**, then fades |
+| **B7-3** | Open the transcript afterwards | The same line is there, marked `sign` |
+
+Worth doing deliberately: set the two devices' clocks a minute apart. That is
+the condition the bug needed, and B7-1 must still pass.
+
+## B8 — interview mode (round 2)
+
+| # | Do this | Expect |
+|---|---|---|
+| **B8-1** | Host: **More options → Turn on interview mode** | The other device shows the disclaimer |
+| **B8-2** | Other device: **Continue in full screen** | It goes full screen |
+| **B8-3** | Leave full screen (Esc) | Overlay: "**This is your only warning**". Host gets a toast saying **warned** |
+| **B8-4** | Click **Return to the meeting** | Back in full screen, overlay gone, **still in the meeting** |
+| **B8-5** | Leave full screen a second time | Taken **out** of the meeting; host gets a toast saying **removed** |
+| **B8-6** | On the ended screen | A reason is shown and there is **no Rejoin button** |
+| **B8-7** | Try to rejoin from the lobby link | **Refused** — you stay in the lobby |
+| **B8-8** | Host: open the transcript | Both the **warning** and the **removal** appear as system lines |
 
 ---
 

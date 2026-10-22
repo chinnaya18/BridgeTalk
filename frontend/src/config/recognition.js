@@ -88,6 +88,16 @@ export const CAPTIONS = {
   // How long the fade-out itself takes, once the TTL has elapsed.
   BLOCK_FADE_MS: 600,
 
+  // Sign blocks stay longer than speech ones.
+  //
+  // Speech streams continuously, so its block keeps refreshing while somebody
+  // talks. A sign caption is committed once per MOVEMENT — one word every few
+  // seconds — and the hearing participant is watching the signer, not the
+  // caption rail. At five seconds the words were gone before they looked down,
+  // surviving only in the transcript, which is exactly how the bug was
+  // reported.
+  SIGN_BLOCK_TTL_MS: 20000,
+
   // At most this many speaker blocks on screen; the oldest is dropped first.
   // Two is the specified number, and it is also the most that fits in the
   // 140px rail without either block losing its third line.

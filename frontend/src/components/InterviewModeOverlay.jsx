@@ -16,6 +16,9 @@ export default function InterviewModeOverlay({
   maxViolations,
   isFullscreen,
   onReturn,
+  // 'warned' after the first departure: the next one ends the interview. The
+  // overlay says so plainly rather than leaving it to be discovered.
+  isFinalWarning = false,
 }) {
   const remaining = Math.max(0, maxViolations - awayCount);
 
@@ -35,9 +38,21 @@ export default function InterviewModeOverlay({
         </h2>
 
         <p className="mt-3 text-sm text-dark-text">
-          Interview mode is on. This has been recorded and the host has been
-          notified.
+          Interview mode is on. This has been recorded, written into the
+          meeting transcript, and the host has been notified.
         </p>
+
+        {isFinalWarning ? (
+          <p
+            role="alert"
+            className="mt-3 rounded-lg border border-dark-danger bg-dark-danger/15 p-3
+                       text-sm font-medium text-dark-text"
+          >
+            This is your only warning. If you leave the meeting screen again
+            you will be removed from this interview and will not be able to
+            rejoin.
+          </p>
+        ) : null}
 
         <p className="mt-2 text-sm text-dark-muted">
           Times recorded: <strong className="tabular-nums text-lg">{awayCount}</strong>

@@ -136,6 +136,10 @@ class MeetingParticipant(Base):
         server_default=func.now(),
     )
     left_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Set when Interview Mode removes somebody for leaving the meeting screen
+    # twice. Distinct from `left_at`, which only means "not here now": a
+    # removed participant may NOT rejoin, and `join_meeting` refuses them.
+    removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     meeting: Mapped["Meeting"] = relationship(back_populates="participants")
     user: Mapped["User"] = relationship(back_populates="participations")

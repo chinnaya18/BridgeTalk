@@ -79,7 +79,12 @@ export default function Stage({
   return (
     <section
       aria-label="Participants"
-      className="relative min-h-0 flex-1 p-4"
+      // overflow-hidden is the belt to the tile's braces. A tile that is ever
+      // mis-sized again must be clipped to the stage rather than allowed to
+      // paint over the caption strip underneath it, because that failure is
+      // silent: the captions are present, correct and in the DOM, and simply
+      // cannot be seen.
+      className="relative min-h-0 flex-1 overflow-hidden p-4"
     >
       {interviewOn ? (
         <span

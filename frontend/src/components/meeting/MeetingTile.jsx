@@ -50,7 +50,22 @@ export default function MeetingTile({
 
   return (
     <div
-      className={`group relative overflow-hidden rounded-tile bg-dark-surface
+      // h-full w-full: FILL THE CONTAINER, never grow to the video's own size.
+      //
+      // Without a height here the tile had none of its own, so the <video>'s
+      // `h-full` (height: 100%) resolved against an auto-height parent and
+      // fell back to the stream's intrinsic aspect ratio. On a wide window a
+      // 4:3 camera then rendered 1480x1110 inside a 640px-tall stage, and the
+      // 486px of overflow painted straight over the caption strip below it.
+      //
+      // Captions were therefore invisible during an ordinary call and
+      // appeared only while someone shared their screen — because the
+      // presenting layout puts both tiles in fixed `aspect-video` boxes,
+      // which gave them a height and stopped the overflow by accident.
+      //
+      // Every container this renders into is height-constrained (the stage
+      // itself, or an `aspect-video` box), so filling it is always right.
+      className={`group relative h-full w-full overflow-hidden rounded-tile bg-dark-surface
                   ${floating ? 'shadow-tile ring-1 ring-black/40' : ''}
                   ${speaking || signing ? 'ring-2 ring-dark-accent' : ''}
                   ${className}`}

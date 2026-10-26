@@ -1480,6 +1480,158 @@ and the full interaction is covered against a real browser instead.
 
 ---
 
+# Round 5 — the video was painted over the captions
+
+Baseline: `5541c03`. Suites before the change:
+**284 backend passed / 2 skipped · 99 frontend · 0 lint errors · build OK.**
+
+---
+
+## Fix 12 — captions appeared only while somebody shared their screen
+
+### What was reported
+
+> the caption strip is not visible when we are normally speaking or signing.
+> The captions are not visible on both the user's screen. only when one user
+> shares the screen the caption strip is visible.
+
+With screenshots from both devices, which is what made this solvable.
+
+### Root cause
+
+Nothing was wrong with the captions. They were produced, delivered, correct,
+and sitting in the DOM at the right coordinates. **The video was painted on
+top of them.**
+
+`MeetingTile` had no height of its own:
+
+```jsx
+<div className="group relative overflow-hidden rounded-tile bg-dark-surface">
+  <video className="h-full w-full object-cover" />
+```
+
+`h-full` is `height: 100%`, and a percentage height against an **auto-height**
+parent does not resolve — so the video fell back to the stream's intrinsic
+aspect ratio, and the tile grew to match it. Measured in a real browser, with
+the hit test below:
+
+```
+=== two participants, nobody presenting ===
+   stage bottom=640  rail top=640
+   stage videos (w x h, bottom): [{"w":1480,"h":1110,"bottom":1126}, ...]
+   what is painted at the rail's centre: VIDEO.h-full w-full object-cover
+   => caption strip COVERED by the video
+```
+
+A 4:3 camera rendered **1480x1110** inside a **640px** stage: 486px of
+overflow, straight over the caption strip. The stage had no `overflow-hidden`
+to clip it.
+
+### Why sharing a screen "fixed" it
+
+By accident. The presenting branch puts both cameras in fixed boxes:
+
+```jsx
+<div className="aspect-video shrink-0">{localTile}</div>
+```
+
+`aspect-video` gives the tile a real height, so `h-full` resolves, nothing
+overflows, and the captions become visible:
+
+```
+=== deaf user presents ===
+   stage videos (w x h, bottom): [{"w":1264,"h":608,"bottom":624}, ...]
+   what is painted at the rail's centre: DIV.mx-auto flex h-full max-w-caption
+   => caption strip VISIBLE
+```
+
+That is the whole of the reported difference.
+
+### Why four rounds of tests missed it
+
+Every earlier check asked whether the caption was **in the rail** — the DOM
+text, the block grouping, the TTL, the socket. All of those were true the
+whole time. None of them asked whether the rail could be **seen**.
+
+Geometry was not enough either: the rail measured `[640..780]`, height 140,
+"fully on screen", in every viewport tried — while being completely obscured.
+The test that finds this is `document.elementFromPoint` at the centre of the
+strip, asking what is actually painted there.
+
+### The fix
+
+**`frontend/src/components/meeting/MeetingTile.jsx`** — the tile now fills its
+container instead of growing to the stream:
+
+```jsx
+className={`group relative h-full w-full overflow-hidden rounded-tile ...`}
+```
+
+Both call sites already render into height-constrained containers (the stage
+itself, or an `aspect-video` box), so filling is always the right behaviour.
+
+**`frontend/src/components/meeting/Stage.jsx`** — the stage now clips:
+
+```jsx
+className="relative min-h-0 flex-1 overflow-hidden p-4"
+```
+
+Belt to the tile's braces. A mis-sized tile must be clipped rather than
+allowed to cover the captions, because that failure mode is silent.
+
+### Verified, both directions
+
+```
+=== ordinary call, nobody presenting ===
+no video overflows the stage any more (deaf)         ok
+no video overflows the stage any more (hearing)      ok
+caption strip is visible on the deaf screen          ok
+caption strip is visible on the hearing screen       ok
+
+=== deaf user SIGNS -> hearing user must read it ===
+hearing user SEES the deaf user's sign caption       ok
+deaf user does NOT see their own words               ok
+   hearing rail: "Demo Deaf User · Sign · healthy"
+
+=== hearing user SPEAKS -> deaf user must read it ===
+deaf user SEES the hearing user's speech caption     ok
+hearing user does NOT see their own words            ok
+   deaf rail: "Demo Hearing User · Speech · good evening everyone"
+
+=== and still works while presenting ===
+rail hit-test VISIBLE, overflow false, text "Demo Deaf User · Sign · location"
+```
+
+Run at two different window sizes (1512x860 and 1792x760), which is what the
+reported screenshots showed.
+
+### Tests added
+
+`frontend/src/test/captionRailNotCovered.test.jsx` — 3 tests: every camera
+tile sizes to its container, the stage clips, and the tiles stay sized while
+presenting. All three fail if either half of the fix is reverted.
+
+Their limit is stated in the file: jsdom has no layout engine, so it cannot
+catch the overflow itself. It pins the two properties whose absence caused it;
+the occlusion itself is checked against a real browser by hit-testing the
+centre of the strip.
+
+---
+
+# Round 5 — suite results
+
+| Suite | Baseline (`5541c03`) | After round 5 |
+|---|---|---|
+| Backend `pytest` | 284 passed, 2 skipped | **284 passed, 2 skipped** |
+| Frontend `npm run lint` | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend `npm test` | 99 passed | **102 passed** |
+| Frontend `npx vite build` | succeeded | **succeeded** |
+| Browser hit-test, both directions | did not exist | **9 of 9** |
+
+**Nothing that passed in the baseline fails.** New tests: **+3 frontend**.
+
+---
+
 # Manual test script — two devices
 
 Everything below needs a camera, a voice, or two devices. **None of it has been

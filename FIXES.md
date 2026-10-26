@@ -1353,6 +1353,133 @@ socket and never exercised capture.
 
 ---
 
+# Round 4 — the captions were switched off
+
+Baseline: `e98f775`. Suites before the change:
+**284 backend passed / 2 skipped · 92 frontend · 0 lint errors · build OK.**
+
+---
+
+## Fix 11 — one stray keypress removed the translation
+
+### What was reported
+
+> still the captions are not being displyed in the hearing user's screen but
+> the signs are recognized and trnaslated and displayed in transcript alone.
+
+### What it was NOT
+
+Round 3 fixed capture, and the transcript proved it: signs were recognised and
+written as `SIGN` rows. The obvious next suspect was delivery, so that was
+tested four ways against the running app, with two browsers:
+
+| Checked | Result |
+|---|---|
+| one signed word — interim then final, one segment id | rail shows `Demo Deaf User · Sign · old` |
+| a second word a few seconds later | `old location` — appended to the same block |
+| the hearing user talking continuously at the same time | sign captions still shown |
+| 10 s after the last sign (speech TTL is 5 s) | still on screen |
+| the hearing user's caption socket killed mid-meeting | reconnects by itself, captions resume |
+
+The signer's own rail correctly stayed empty throughout — you do not read your
+own words back.
+
+So delivery was sound, and the pipeline could not be made to fail. The missing
+evidence was the one screen nobody had looked at.
+
+### Root cause
+
+On the hearing user's screen there was **no caption strip at all** — not an
+empty one. Captions were switched off on that device.
+
+```jsx
+if (!visible) return null;   // CaptionRail
+```
+
+Hiding captions removes the strip entirely so the stage can reclaim the 140px.
+That is a reasonable choice on its own, but combined with how captions were
+switched off it was not:
+
+```js
+} else if (!modifier && event.key.toLowerCase() === 'c') {
+  setCaptionsVisible((value) => !value);
+}
+```
+
+A **bare `c`** — no modifier, anywhere outside a text field. The microphone
+needs Ctrl/Cmd+D and the camera Ctrl/Cmd+E; captions needed nothing. One
+accidental keystroke removed the entire translation channel, left nothing on
+screen to say what had happened, and the transcript panel kept filling from
+the server behind it, which made it look like a delivery fault.
+
+On a tool whose whole purpose is making one side of a conversation readable to
+the other, that is the most expensive thing a stray keypress could do.
+
+### The fix
+
+**`frontend/src/utils/shortcuts.js`** (new) — the rule, as a pure function:
+
+- captions now need **Ctrl/Cmd+Shift+C**
+- plain Ctrl/Cmd+C is deliberately *not* used: that is Copy, and this page
+  asks people to copy the meeting link. Shift keeps the `c` mnemonic without
+  taking Copy away.
+- the microphone and camera are untouched
+
+**`frontend/src/pages/MeetingRoom.jsx`** — the handler now asks
+`shortcutFor(event)`, and both the shortcut and the control-bar button go
+through one `toggleCaptions`, which **says so when captions go off**:
+
+> Captions hidden — press Ctrl/Cmd+Shift+C to show them again
+
+Switching them back on needs no announcement: the captions reappearing is the
+feedback. Hiding is the direction that used to be silent.
+
+### Verified in a real browser
+
+```
+caption strip present on join              ok    the control-bar button still hides them  ok
+a bare "c" no longer hides captions        ok    the button explains too                  ok
+Ctrl+C (Copy) does not hide captions       ok    and brings them back                     ok
+Ctrl+Shift+C hides them                    ok    Ctrl+D still toggles the microphone      ok
+and says so, naming the way back           ok    Ctrl+E still toggles the camera          ok
+Ctrl+Shift+C brings them back              ok
+                                                 11 passed, 0 failed
+```
+
+### Tests added
+
+`frontend/src/test/shortcuts.test.js` — 7 tests on the rule: a bare `c` is
+ignored, Ctrl/Cmd+Shift+C toggles captions, Ctrl/Cmd+C is left to Copy, the
+microphone and camera are unchanged, no unmodified key is ever a command,
+keystrokes aimed at a text field are ignored, and a malformed event is
+survived. Three of them fail if the old bare-`c` rule is put back.
+
+### Why the rule was extracted rather than tested through the page
+
+A page-level test was written first and **discarded for being flaky**. Under
+jsdom the meeting room navigates away on its own about 1.2 seconds after
+mounting — measured, with no keys pressed at all — so any multi-step
+interaction test races that teardown and fails for a reason that has nothing
+to do with captions. A test that passes and fails at random is worse than no
+test, so the rule moved into a pure function where it is decided by one call,
+and the full interaction is covered against a real browser instead.
+
+---
+
+# Round 4 — suite results
+
+| Suite | Baseline (`e98f775`) | After round 4 |
+|---|---|---|
+| Backend `pytest` | 284 passed, 2 skipped | **284 passed, 2 skipped** |
+| Frontend `npm run lint` | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend `npm test` | 92 passed | **99 passed** |
+| Frontend `npx vite build` | succeeded | **succeeded** |
+| Browser check of the shortcuts | did not exist | **11 of 11** |
+
+**Nothing that passed in the baseline fails.** New tests: **+7 frontend**.
+
+---
+
 # Manual test script — two devices
 
 Everything below needs a camera, a voice, or two devices. **None of it has been

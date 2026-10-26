@@ -29,6 +29,7 @@ import { meetings as meetingsApi, transcripts as transcriptsApi } from '../servi
 import { loadDevicePreferences, saveDevicePreferences } from '../services/devicePreferences';
 import { formatElapsed } from '../utils/formatters';
 import { toWireFormat } from '../utils/landmarkUtils';
+import { shortcutFor } from '../utils/shortcuts';
 
 /**
  * The meeting room.
@@ -950,29 +951,50 @@ export default function MeetingRoom() {
   const localActivity = activity[localName];
   const remoteActivity = remoteName ? activity[remoteName] : null;
 
+  /**
+   * Show or hide the caption area — from the button and the shortcut alike.
+   *
+   * Turning captions off REMOVES the strip entirely (the stage reclaims the
+   * 140px), so there is nothing left on screen to explain where the captions
+   * went. On a deaf-accessibility tool that is the whole translation channel
+   * disappearing in silence, and it is exactly how a meeting was spent with
+   * the hearing participant seeing no signs at all while the transcript
+   * filled up normally behind them.
+   *
+   * So switching them OFF says so, and says how to get them back. Switching
+   * them on needs no announcement: the captions reappearing is the feedback.
+   */
+  const toggleCaptions = useCallback(() => {
+    setCaptionsVisible((value) => {
+      if (value) {
+        toastRef.current?.show('Captions hidden — press Ctrl/Cmd+Shift+C to show them again', {
+          icon: 'closed_caption_disabled',
+          durationMs: 5000,
+        });
+      }
+      return !value;
+    });
+  }, []);
+
   // --- keyboard shortcuts --------------------------------------------------
-  // Ctrl/Cmd+D microphone, Ctrl/Cmd+E camera, C captions. Skipped while focus
-  // is in a text field, or typing a meeting code would toggle the mic.
+  // Ctrl/Cmd+D microphone, Ctrl/Cmd+E camera, Ctrl/Cmd+Shift+C captions.
+  // Skipped while focus is in a text field, or typing a meeting code would
+  // toggle the mic.
   useEffect(() => {
     const handler = (event) => {
-      const tag = event.target?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      // The rule lives in utils/shortcuts.js, where it is unit-tested.
+      const action = shortcutFor(event);
+      if (!action) return;
 
-      const modifier = event.ctrlKey || event.metaKey;
-      if (modifier && event.key.toLowerCase() === 'd') {
-        event.preventDefault();
-        toggleMic();
-      } else if (modifier && event.key.toLowerCase() === 'e') {
-        event.preventDefault();
-        toggleCamera();
-      } else if (!modifier && event.key.toLowerCase() === 'c') {
-        setCaptionsVisible((value) => !value);
-      }
+      event.preventDefault();
+      if (action === 'mic') toggleMic();
+      else if (action === 'camera') toggleCamera();
+      else if (action === 'captions') toggleCaptions();
     };
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [toggleCamera, toggleMic]);
+  }, [toggleCamera, toggleMic, toggleCaptions]);
 
   // --- toasts --------------------------------------------------------------
   // Keyed on the peer's NAME, not the peer object: useWebRTC produces a new
@@ -1224,7 +1246,7 @@ export default function MeetingRoom() {
         meetingCode={code}
         onToggleMic={toggleMic}
         onToggleCamera={toggleCamera}
-        onToggleCaptions={() => setCaptionsVisible((value) => !value)}
+        onToggleCaptions={toggleCaptions}
         onToggleSign={() => setSignRecognitionOn((value) => !value)}
         onPresent={handlePresent}
         onOpenPanel={(panel) => setOpenPanel((current) => (current === panel ? null : panel))}

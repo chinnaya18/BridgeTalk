@@ -272,10 +272,35 @@ export default function MeetingRoom() {
   // Attach the stream to the local <video>, which MediaPipe reads frames from.
   // The tile owns its own element for display; this hidden one is the detection
   // source, so it is wired here and kept out of the layout.
+  //
+  // AND IT HAS TO BE PLAYED EXPLICITLY.
+  //
+  // The element carries `autoPlay`, but it is also `display: none`, and Chrome
+  // does not autoplay an element it is not rendering. So it sat at
+  // `paused: true` with `currentTime` frozen at 0 for the whole meeting —
+  // while `readyState` was 4 and `videoWidth` 640, which is everything the
+  // guard in `detect()` checks before handing the frame to MediaPipe.
+  //
+  // That is the worst shape a bug can take: nothing errored. MediaPipe ran at
+  // 10 FPS on the SAME first frame for the entire call and truthfully reported
+  // no hands, whatever the signer did. The hearing user's captions were empty
+  // because the signs were never captured at all.
+  //
+  // play() needs no user gesture here because the element is muted.
   useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
-    }
+    const video = localVideoRef.current;
+    if (!video || !localStream) return;
+
+    video.srcObject = localStream;
+    video.play().catch((cause) => {
+      // AbortError is routine — a replaced srcObject or a remount interrupts
+      // the pending play(). Anything else means hand tracking is about to run
+      // on a frozen frame, which is exactly the silence that hid this bug, so
+      // it gets said out loud.
+      if (cause?.name !== 'AbortError') {
+        console.warn('The hand-tracking video would not play', cause);
+      }
+    });
   }, [localStream]);
 
   // --- captions ------------------------------------------------------------

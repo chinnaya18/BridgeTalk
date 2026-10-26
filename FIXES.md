@@ -1190,6 +1190,169 @@ because the interview-mode rule's tests landed in the baseline commit.
 
 ---
 
+# Round 3 — the deaf user's signs were never captured
+
+Baseline for this round: `7cec029`. Suites before the change:
+**284 backend passed / 2 skipped · 90 frontend · 0 lint errors · build OK.**
+
+---
+
+## Fix 10 — sign capture: MediaPipe was reading one frozen frame
+
+### What was reported
+
+> when the deaf user signs the captions are not displyed in the hearing user's
+> screen. the signs itself are not being captured
+
+### Root cause
+
+MediaPipe does not read the camera. It reads frames from a dedicated `<video>`
+element that the meeting room keeps out of the layout:
+
+```jsx
+<video ref={localVideoRef} autoPlay playsInline muted className="hidden" />
+```
+
+Tailwind's `hidden` is `display: none`, and **Chrome does not autoplay an
+element it is not rendering**. Measured in the running app:
+
+```
+video elements on the deaf user's page:
+ [0] hidden=true  stream=true readyState=4 640x480 paused=TRUE  t=0  ->0    STALLED
+ [1] hidden=false stream=true readyState=4 640x480 paused=false t=7.1->9.6  ADVANCING
+```
+
+Element `[0]` is the detection source. It was **paused**, with `currentTime`
+frozen at **0** for the entire meeting, while the visible tile played normally.
+
+### Why nothing looked wrong
+
+The guard inside `detect()` is:
+
+```js
+if (video.readyState < 2 || video.videoWidth === 0) return null;
+```
+
+A paused element with a stream attached still reports `readyState: 4` and
+`videoWidth: 640`. So the guard passed, MediaPipe ran at 10 FPS against the
+**same first frame** for the whole call, and truthfully reported no hands
+whatever the signer did.
+
+Every downstream symptom then pointed somewhere else:
+
+- the landmark socket was busy — 80 frames in 8 s, exactly 10 FPS
+- the server answered every one of them, with `prediction label=nothing`
+- no error banner, no console error, `isReady` true, the model loaded
+- the control bar correctly showed "Turn off sign recognition" — it *was* on
+
+The hearing user's captions were empty because there was never a sign to
+caption. The caption transport, which the previous round fixed, was fine.
+
+Instrumented confirmation that the fix is the right one, before changing code:
+
+```
+--- as shipped ---
+before: paused=true  t=0    framesChangeBetweenSamples=false
+--- after calling play() on that element ---
+after : paused=false t=8.76 framesChangeBetweenSamples=true
+play() error: none
+```
+
+Sampling the element onto a canvas twice is the part that matters: it proves
+the pixels MediaPipe receives actually change, rather than only that a clock
+moved.
+
+### The fix — `frontend/src/pages/MeetingRoom.jsx`
+
+Play the element explicitly instead of relying on the `autoPlay` attribute.
+`play()` needs no user gesture because the element is muted.
+
+```js
+useEffect(() => {
+  const video = localVideoRef.current;
+  if (!video || !localStream) return;
+
+  video.srcObject = localStream;
+  video.play().catch((cause) => {
+    if (cause?.name !== 'AbortError') {
+      console.warn('The hand-tracking video would not play', cause);
+    }
+  });
+}, [localStream]);
+```
+
+`AbortError` is swallowed because a replaced `srcObject` or a remount
+routinely interrupts a pending `play()`. Anything else is reported: silence is
+what hid this bug for three rounds, so the failure path now says something.
+
+`display: none` is left alone — it was not the problem once the element is
+played, and the measurement above shows frames flowing through it.
+
+### Not changed, deliberately
+
+- `SignDetection.jsx` already calls `await videoRef.current.play()` and its
+  video is visible, so the standalone page was never affected. That is why
+  sign detection appeared to work there but not in a meeting.
+- The default `recognitionMode` is `dynamic` (word signs). Worth knowing when
+  testing — fingerspelled **letters** need the ISL or ASL mode from Settings —
+  but it is a setting, not this bug, so it was not touched.
+
+### Verified
+
+```
+detection video is playing, not paused                  ok
+its clock advances (frames are being decoded)           ok
+MediaPipe receives CHANGING frames, not a frozen one    ok
+the guard in detect() still passes                      ok
+```
+
+And the full regression sweep, so the rest of the meeting room is untouched:
+
+```
+peer connection connected both sides   ok     guest gets disclaimer         ok
+host decodes guest camera              ok     guest in full screen          ok
+guest decodes host camera              ok     departure 1 warns host        ok
+detection video is playing             ok     guest sees only-warning       ok
+MediaPipe gets changing frames         ok     Return restores meeting       ok
+sign caption reaches hearing user      ok     departure 2 tells host REMOVAL ok
+still readable 11s later               ok     guest removed from meeting    ok
+guest told host is presenting          ok     Rejoin withheld               ok
+guest receives TWO video streams       ok
+both decoding frames                   ok     18 passed, 0 failed
+```
+
+### Tests added
+
+`frontend/src/test/signCaptureSource.test.jsx` — 2 tests: the detection video
+is played explicitly, and it keeps the `muted` attribute that lets `play()`
+run without a user gesture. Confirmed to **fail** with the `play()` call
+removed.
+
+### What still needs a human
+
+No synthetic camera can produce a hand MediaPipe will detect, so the last step
+— sign a letter and watch the caption appear on the other screen — cannot be
+automated here. `scripts/_sign` style instrumentation showed `hands=0` on every
+frame throughout, which is correct for Chrome's fake camera and is exactly why
+this bug survived the earlier end-to-end runs: they injected captions onto the
+socket and never exercised capture.
+
+---
+
+# Round 3 — suite results
+
+| Suite | Baseline (`7cec029`) | After round 3 |
+|---|---|---|
+| Backend `pytest` | 284 passed, 2 skipped | **284 passed, 2 skipped** |
+| Frontend `npm run lint` | 0 errors, 6 warnings | **0 errors, 6 warnings** |
+| Frontend `npm test` | 90 passed | **92 passed** |
+| Frontend `npx vite build` | succeeded | **succeeded** |
+| Two-browser regression sweep | 19 of 19 | **18 of 18** |
+
+**Nothing that passed in the baseline fails.** New tests: **+2 frontend**.
+
+---
+
 # Manual test script — two devices
 
 Everything below needs a camera, a voice, or two devices. **None of it has been
